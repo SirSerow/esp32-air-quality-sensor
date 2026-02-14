@@ -2,7 +2,9 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -18,12 +20,14 @@
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 
 // K0I05 components
 #include "ahtxx.h"
 #include "ens160.h"
+#include "secrets.h"
 
 // EEPROM
 
@@ -38,10 +42,11 @@ static httpd_handle_t s_http_server = NULL;
 #define NVS_NAMESPACE       "sensorlog"
 #define NVS_SLOT_COUNT      180
 
-#define WIFI_AP_SSID        "CO2-Sensor-AP"
-#define WIFI_AP_PASS        "co2sensor123"
 #define WIFI_AP_CHANNEL     1
 #define WIFI_AP_MAX_CONN    4
+#define NTP_SERVER          "pool.ntp.org"
+#define STA_CONNECT_TIMEOUT_MS 20000
+#define NTP_SYNC_TIMEOUT_MS    20000
 
 #define SENSOR_READ_INTERVAL_MS 180000 // 3 minutes
 
@@ -53,6 +58,7 @@ typedef struct {
 } sensors_t;
 
 typedef struct {
+    uint32_t unix_time;
     int16_t temperature_c_x100;
     int16_t humidity_pct_x100;
     uint16_t eco2_ppm;
@@ -63,7 +69,18 @@ typedef struct {
     uint8_t has_ens;
 } sensor_log_entry_t;
 
-static esp_err_t wifi_start_softap(void)
+typedef struct {
+    int16_t temperature_c_x100;
+    int16_t humidity_pct_x100;
+    uint16_t eco2_ppm;
+    uint16_t tvoc_ppb;
+    uint8_t aqi;
+    uint8_t ens_validity;
+    uint8_t has_aht;
+    uint8_t has_ens;
+} sensor_log_entry_legacy_t;
+
+static esp_err_t network_stack_init_once(void)
 {
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -72,6 +89,107 @@ static esp_err_t wifi_start_softap(void)
 
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static bool system_time_valid(void)
+{
+    time_t now = 0;
+    time(&now);
+    return now > 1700000000;
+}
+
+static void configure_timezone_jst(void)
+{
+    setenv("TZ", "JST-9", 1);
+    tzset();
+}
+
+static esp_err_t sync_time_via_sta(void)
+{
+    if (strlen(WIFI_STA_SSID) == 0) {
+        ESP_LOGI(TAG, "STA credentials not set, skip NTP sync");
+        return ESP_OK;
+    }
+
+    esp_err_t err = network_stack_init_once();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (!sta_netif) {
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t sta_cfg = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    strncpy((char *)sta_cfg.sta.ssid, WIFI_STA_SSID, sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, WIFI_STA_PASS, sizeof(sta_cfg.sta.password) - 1);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_connect());
+
+    int waited_ms = 0;
+    bool connected = false;
+    while (waited_ms < STA_CONNECT_TIMEOUT_MS) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            connected = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        waited_ms += 500;
+    }
+
+    if (!connected) {
+        ESP_LOGW(TAG, "STA connect timeout, skip NTP sync");
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, NTP_SERVER);
+    esp_sntp_init();
+
+    waited_ms = 0;
+    while (waited_ms < NTP_SYNC_TIMEOUT_MS && !system_time_valid()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        waited_ms += 500;
+    }
+
+    if (system_time_valid()) {
+        time_t now;
+        time(&now);
+        ESP_LOGI(TAG, "NTP time synced: %lu", (unsigned long)now);
+    } else {
+        ESP_LOGW(TAG, "NTP sync timeout");
+    }
+
+    esp_sntp_stop();
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    return ESP_OK;
+}
+
+static esp_err_t wifi_start_softap(void)
+{
+    esp_err_t err = network_stack_init_once();
+    if (err != ESP_OK) {
         return err;
     }
 
@@ -192,6 +310,47 @@ static void nvs_log_stats(void)
     }
 }
 
+static bool nvs_read_entry_compat(nvs_handle_t nvs, const char *key, sensor_log_entry_t *out_entry)
+{
+    size_t size = sizeof(*out_entry);
+    esp_err_t err = nvs_get_blob(nvs, key, out_entry, &size);
+    if (err == ESP_OK && size == sizeof(*out_entry)) {
+        return true;
+    }
+
+    sensor_log_entry_legacy_t legacy = {0};
+    size = sizeof(legacy);
+    err = nvs_get_blob(nvs, key, &legacy, &size);
+    if (err == ESP_OK && size == sizeof(legacy)) {
+        memset(out_entry, 0, sizeof(*out_entry));
+        out_entry->temperature_c_x100 = legacy.temperature_c_x100;
+        out_entry->humidity_pct_x100 = legacy.humidity_pct_x100;
+        out_entry->eco2_ppm = legacy.eco2_ppm;
+        out_entry->tvoc_ppb = legacy.tvoc_ppb;
+        out_entry->aqi = legacy.aqi;
+        out_entry->ens_validity = legacy.ens_validity;
+        out_entry->has_aht = legacy.has_aht;
+        out_entry->has_ens = legacy.has_ens;
+        out_entry->unix_time = 0;
+        return true;
+    }
+
+    return false;
+}
+
+static void format_unix_time(uint32_t unix_time, char *buf, size_t buf_len)
+{
+    if (unix_time == 0) {
+        snprintf(buf, buf_len, "-");
+        return;
+    }
+
+    time_t t = (time_t)unix_time;
+    struct tm tm_local;
+    localtime_r(&t, &tm_local);
+    strftime(buf, buf_len, "%Y-%m-%d %H:%M:%S JST", &tm_local);
+}
+
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
 {
     nvs_handle_t nvs = 0;
@@ -254,7 +413,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
 
     SEND_CHUNK_OR_EXIT(
         "<table border='1' cellspacing='0' cellpadding='6'>"
-        "<tr><th>#</th><th>T(C)</th><th>RH(%)</th><th>AQI</th><th>TVOC(ppb)</th><th>eCO2(ppm)</th><th>ENS validity</th></tr>");
+        "<tr><th>#</th><th>Time</th><th>T(C)</th><th>RH(%)</th><th>AQI</th><th>TVOC(ppb)</th><th>eCO2(ppm)</th><th>ENS validity</th></tr>");
 
     uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
     for (uint32_t i = 0; i < count; i++) {
@@ -263,18 +422,19 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
 
         sensor_log_entry_t entry = {0};
-        size_t size = sizeof(entry);
-        err = nvs_get_blob(nvs, key, &entry, &size);
-        if (err != ESP_OK || size != sizeof(entry)) {
+        if (!nvs_read_entry_compat(nvs, key, &entry)) {
             continue;
         }
 
-        char row[320];
+        char row[400];
+        char time_str[32];
+        format_unix_time(entry.unix_time, time_str, sizeof(time_str));
         if (entry.has_aht) {
             if (entry.has_ens) {
                 snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%.2f</td><td>%.2f</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
+                         "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
+                         time_str,
                          entry.temperature_c_x100 / 100.0f,
                          entry.humidity_pct_x100 / 100.0f,
                          entry.aqi,
@@ -283,8 +443,9 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
                          entry.ens_validity);
             } else {
                 snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%.2f</td><td>%.2f</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
+                         "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
+                         time_str,
                          entry.temperature_c_x100 / 100.0f,
                          entry.humidity_pct_x100 / 100.0f,
                          entry.ens_validity);
@@ -292,16 +453,18 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         } else {
             if (entry.has_ens) {
                 snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>-</td><td>-</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
+                         "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
+                         time_str,
                          entry.aqi,
                          entry.tvoc_ppb,
                          entry.eco2_ppm,
                          entry.ens_validity);
             } else {
                 snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
+                         "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
+                         time_str,
                          entry.ens_validity);
             }
         }
@@ -311,9 +474,9 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
     SEND_CHUNK_OR_EXIT(
         "</table>"
         "<script>"
-        "function drawLine(canvasId,name,color,values){"
+        "function drawLine(canvasId,name,color,values,timeLabels){"
         "const c=document.getElementById(canvasId);if(!c)return;"
-        "const ctx=c.getContext('2d');const w=c.width,h=c.height,p=30;"
+        "const ctx=c.getContext('2d');const w=c.width,h=c.height,p=32;"
         "ctx.clearRect(0,0,w,h);ctx.fillStyle='#fff';ctx.fillRect(0,0,w,h);"
         "ctx.strokeStyle='#bbb';ctx.strokeRect(p,p,w-2*p,h-2*p);"
         "let min=Infinity,max=-Infinity,maxN=values.length;"
@@ -324,22 +487,28 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         "ctx.fillStyle='#333';ctx.font='12px Arial';ctx.fillText(max.toFixed(2),4,p+8);ctx.fillText(min.toFixed(2),4,h-p);"
         "ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();let started=false;"
         "for(let i=0;i<values.length;i++){const v=values[i];if(v==null)continue;const x=p+i*sx;const y=h-p-(v-min)*sy;if(!started){ctx.moveTo(x,y);started=true;}else{ctx.lineTo(x,y);}}ctx.stroke();"
+        "ctx.fillStyle='#666';ctx.font='10px Arial';"
+        "const maxLabels=6;const step=Math.max(1,Math.ceil(maxN/maxLabels));"
+        "for(let i=0;i<maxN;i+=step){const lbl=timeLabels&&timeLabels[i]?timeLabels[i]:null;if(!lbl)continue;const x=p+i*sx;ctx.fillText(lbl,Math.max(0,x-14),h-8);}"
+        "if(timeLabels&&timeLabels[maxN-1]){const x=p+(maxN-1)*sx;ctx.fillText(timeLabels[maxN-1],Math.max(0,x-14),h-8);}"
         "ctx.fillStyle=color;ctx.fillRect(w-140,6,10,10);ctx.fillStyle='#222';ctx.fillText(name,w-125,15);"
         "}"
         "async function refreshCharts(){"
         "try{const r=await fetch('/json');const d=await r.json();const e=d.entries||[];"
+        "const fmt=new Intl.DateTimeFormat('ja-JP',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Tokyo'});"
+        "const timeLabels=e.map(x=>x.unix_time?fmt.format(new Date(x.unix_time*1000)):null);"
         "const temp=e.map(x=>x.has_aht?x.temperature_c:null);"
         "const rh=e.map(x=>x.has_aht?x.humidity_pct:null);"
         "const aqi=e.map(x=>x.has_ens?x.aqi:null);"
         "const tvoc=e.map(x=>x.has_ens?x.tvoc_ppb:null);"
         "const eco2=e.map(x=>x.has_ens?x.eco2_ppm:null);"
         "const validity=e.map(x=>x.ens_validity);"
-        "drawLine('chart_temp','Temp C','#d14',temp);"
-        "drawLine('chart_rh','RH %','#06c',rh);"
-        "drawLine('chart_aqi','AQI','#1a7f37',aqi);"
-        "drawLine('chart_tvoc','TVOC','#a36a00',tvoc);"
-        "drawLine('chart_eco2','eCO2','#6f42c1',eco2);"
-        "drawLine('chart_validity','ENS validity','#444',validity);"
+        "drawLine('chart_temp','Temp C','#d14',temp,timeLabels);"
+        "drawLine('chart_rh','RH %','#06c',rh,timeLabels);"
+        "drawLine('chart_aqi','AQI','#1a7f37',aqi,timeLabels);"
+        "drawLine('chart_tvoc','TVOC','#a36a00',tvoc,timeLabels);"
+        "drawLine('chart_eco2','eCO2','#6f42c1',eco2,timeLabels);"
+        "drawLine('chart_validity','ENS validity','#444',validity,timeLabels);"
         "}catch(_e){}}"
         "refreshCharts();setInterval(refreshCharts,5000);"
         "</script>"
@@ -411,9 +580,7 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
         snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
 
         sensor_log_entry_t entry = {0};
-        size_t size = sizeof(entry);
-        err = nvs_get_blob(nvs, key, &entry, &size);
-        if (err != ESP_OK || size != sizeof(entry)) {
+        if (!nvs_read_entry_compat(nvs, key, &entry)) {
             continue;
         }
 
@@ -424,9 +591,10 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
 
         char item[320];
         snprintf(item, sizeof(item),
-                 "{\"index\":%lu,\"has_aht\":%u,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,"
+                 "{\"index\":%lu,\"unix_time\":%lu,\"has_aht\":%u,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,"
                  "\"has_ens\":%u,\"aqi\":%u,\"tvoc_ppb\":%u,\"eco2_ppm\":%u,\"ens_validity\":%u}",
                  (unsigned long)(i + 1),
+                 (unsigned long)entry.unix_time,
                  entry.has_aht,
                  entry.temperature_c_x100 / 100.0f,
                  entry.humidity_pct_x100 / 100.0f,
@@ -504,6 +672,11 @@ static void loop_task(void *pvParameter)
 
     while (1) {
         sensor_log_entry_t log_entry = {0};
+        time_t now = 0;
+        time(&now);
+        if (now > 0) {
+            log_entry.unix_time = (uint32_t)now;
+        }
 
         // ---- AHT21 (temperature / humidity) ----
         float t_c = 0.0f, rh = 0.0f;
@@ -554,6 +727,7 @@ static void loop_task(void *pvParameter)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Init I2C + AHT21 + ENS160");
+    configure_timezone_jst();
 
     nvs_handle_t nvs = 0;
     bool nvs_ready = false;
@@ -564,6 +738,11 @@ void app_main(void)
         nvs_log_stats();
     } else {
         ESP_LOGW(TAG, "NVS init failed, continue without persistence: %s", esp_err_to_name(err));
+    }
+
+    err = sync_time_via_sta();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Time sync before AP failed: %s", esp_err_to_name(err));
     }
 
     err = wifi_start_softap();
