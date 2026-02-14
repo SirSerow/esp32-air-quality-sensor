@@ -1,36 +1,68 @@
-# ESP32 Air Quiality Sensor
+# ESP32 Air Quality Sensor
 
-This is a simple ESP32-based air quality sensor that uses the AHT20 temperature and humidity sensor and the ENS160 air quality sensor. 
+ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quality) data, storing historical samples in NVS, and serving a built-in web dashboard over Wi-Fi hotspot mode.
 
 ## Hardware
 - ESP32-C6-DevKitC-1
-- Sensor board with AHT20 and ENS160 sensors:
-  - AHT20 Temperature and Humidity Sensor
-  - ENS160 Air Quality Sensor
+- Sensor board with:
+  - AHT20 temperature/humidity sensor
+  - ENS160 air quality sensor
 
-## Software
-The project is built using the ESP-IDF framework and PlatformIO. The code is organized into the following directories:
-- `src`: Contains the main application code.
-- `include`: Contains header files for the project.
-- `lib`: Contains any external libraries used in the project.
-- `test`: Contains unit tests for the project.
-- platformio.ini: Configuration file for PlatformIO.
-- cmake_lists.txt: CMake configuration file for ESP-IDF.
-- sdkconfig.esp32-c6-devkitc-1: ESP-IDF configuration file for the ESP32-C6-DevKitC-1 board.
+## Current Features
+- Reads and logs:
+  - Temperature (°C)
+  - Humidity (%)
+  - AQI
+  - TVOC (ppb)
+  - eCO2 (ppm)
+  - ENS validity flag
+- Stores sensor history in NVS using a circular buffer.
+- Starts Wi-Fi SoftAP automatically on boot.
+- Starts built-in HTTP server automatically on boot.
+- Web dashboard at `/` with:
+  - Live-updating table of stored values
+  - Separate graph for each metric
+- JSON API at `/json` for easier parsing/integration.
 
+## Default Runtime Configuration
+- SoftAP SSID: `CO2-Sensor-AP`
+- SoftAP password: `co2sensor123`
+- AP URL: `http://192.168.4.1/`
+- JSON endpoint: `http://192.168.4.1/json`
+- Sampling interval: 3 minutes (`SENSOR_READ_INTERVAL_MS = 180000`)
+- NVS ring-buffer capacity: 180 points (`NVS_SLOT_COUNT = 180`)
 
-## Getting Started
-1. Clone the repository to your local machine.
-2. Open the project in your preferred IDE (e.g., Visual Studio Code with PlatformIO extension).
-3. Connect the ESP32-C6-DevKitC-1 to your computer via USB.
-4. Build and flash the firmware to the ESP32 using PlatformIO.
-5. Monitor the serial output to see the sensor readings. Example output:
-    ``` 
-        I (11990224) MAIN: ENS: AQI=3  TVOC=331 ppb  eCO2=812 ppm
-        I (11991314) MAIN: AHT: T=25.17 C  RH=47.53 %
-        I (11992324) MAIN: ENS: AQI=3  TVOC=344 ppb  eCO2=816 ppm
-        I (11993414) MAIN: AHT: T=25.18 C  RH=47.57 %
-        I (11994424) MAIN: ENS: AQI=3  TVOC=345 ppb  eCO2=816 ppm
-        I (11995514) MAIN: AHT: T=25.18 C  RH=47.58 %
-        I (11996524) MAIN: ENS: AQI=3  TVOC=352 ppb  eCO2=819 ppm
-    ```
+## Project Structure
+- `src/` main application code
+- `include/` project headers
+- `lib/` external/project libraries
+- `test/` test files
+- `platformio.ini` PlatformIO configuration
+- `CMakeLists.txt` CMake/ESP-IDF project file
+- `sdkconfig.esp32-c6-devkitc-1` board-specific ESP-IDF config
+
+## Build, Flash, Monitor
+From the project root:
+
+```bash
+platformio run -e esp32-c6-devkitc-1
+platformio run -e esp32-c6-devkitc-1 -t upload
+platformio device monitor -b 115200
+```
+
+## Accessing the Dashboard
+1. Power/flash the board and wait for boot logs.
+2. Connect your phone/laptop to Wi-Fi `CO2-Sensor-AP`.
+3. Open:
+   - Dashboard: `http://192.168.4.1/`
+   - JSON: `http://192.168.4.1/json`
+
+## Example Serial Logs
+```text
+I (...) MAIN: NVS logging enabled (sensorlog)
+I (...) MAIN: NVS stats: used=... free=... total=... namespaces=...
+I (...) MAIN: WiFi AP started: SSID=CO2-Sensor-AP CH=1
+I (...) MAIN: Web server started on http://192.168.4.1/
+I (...) MAIN: AHT: T=25.17 C  RH=47.53 %
+I (...) MAIN: ENS: AQI=3  TVOC=331 ppb  eCO2=812 ppm
+```
