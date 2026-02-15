@@ -59,7 +59,7 @@ static sdmmc_card_t *s_sd_card = NULL;
 #define STA_CONNECT_TIMEOUT_MS 20000
 #define NTP_SYNC_TIMEOUT_MS    20000
 
-#define SENSOR_READ_INTERVAL_MS 1000 // 1 second
+#define SENSOR_READ_INTERVAL_MS 60000 // 1 minute = 60000 ms, using 1s for testing
 
 // --- SPI pins for ESP32-C6-DevKitC-1 (recommended) ---
 #define PIN_NUM_MISO 21
@@ -69,6 +69,8 @@ static sdmmc_card_t *s_sd_card = NULL;
 
 #define MOUNT_POINT "/sdcard"
 #define LOG_PATH    MOUNT_POINT "/logs.csv"
+#define WEB_GRAPH_POINT_COUNT 540
+#define WEB_TABLE_ROW_COUNT   10
 
 typedef struct {
     ahtxx_handle_t aht;
@@ -695,14 +697,14 @@ static void format_unix_time(uint32_t unix_time, char *buf, size_t buf_len)
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
 {
     esp_err_t err = ESP_OK;
-    sensor_log_entry_t *entries = calloc(NVS_SLOT_COUNT, sizeof(sensor_log_entry_t));
+    sensor_log_entry_t *entries = calloc(WEB_GRAPH_POINT_COUNT, sizeof(sensor_log_entry_t));
     if (!entries) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_sendstr(req, "Out of memory");
         return ESP_ERR_NO_MEM;
     }
     bool from_sd = false;
-    size_t count = load_recent_entries(entries, NVS_SLOT_COUNT, &from_sd);
+    size_t count = load_recent_entries(entries, WEB_GRAPH_POINT_COUNT, &from_sd);
 
 #define SEND_CHUNK_OR_EXIT(chunk_literal_or_buf)                     \
     do {                                                              \
@@ -734,9 +736,9 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         "</div><br>");
 
     char meta[200];
-    snprintf(meta, sizeof(meta), "<p>Stored entries: %lu / %u (%s)</p>",
+    snprintf(meta, sizeof(meta), "<p>Graph points: %lu / %u (%s)</p>",
              (unsigned long)count,
-             NVS_SLOT_COUNT,
+             WEB_GRAPH_POINT_COUNT,
              from_sd ? "SD card" : "NVS");
     SEND_CHUNK_OR_EXIT(meta);
 
@@ -744,7 +746,10 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         "<table border='1' cellspacing='0' cellpadding='6'>"
         "<tr><th>#</th><th>Time</th><th>T(C)</th><th>RH(%)</th><th>AQI</th><th>TVOC(ppb)</th><th>eCO2(ppm)</th><th>ENS validity</th></tr>");
 
-    for (size_t i = 0; i < count; i++) {
+    size_t table_count = count < WEB_TABLE_ROW_COUNT ? count : WEB_TABLE_ROW_COUNT;
+    size_t table_start = count - table_count;
+
+    for (size_t i = table_start; i < count; i++) {
         const sensor_log_entry_t *entry = &entries[i];
 
         char row[400];
@@ -754,7 +759,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
             if (entry->has_ens) {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
-                         (unsigned long)(i + 1),
+                         (unsigned long)(i - table_start + 1),
                          time_str,
                          entry->temperature_c_x100 / 100.0f,
                          entry->humidity_pct_x100 / 100.0f,
@@ -765,7 +770,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
             } else {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
-                         (unsigned long)(i + 1),
+                         (unsigned long)(i - table_start + 1),
                          time_str,
                          entry->temperature_c_x100 / 100.0f,
                          entry->humidity_pct_x100 / 100.0f,
@@ -775,7 +780,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
             if (entry->has_ens) {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
-                         (unsigned long)(i + 1),
+                         (unsigned long)(i - table_start + 1),
                          time_str,
                          entry->aqi,
                          entry->tvoc_ppb,
@@ -784,7 +789,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
             } else {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
-                         (unsigned long)(i + 1),
+                         (unsigned long)(i - table_start + 1),
                          time_str,
                          entry->ens_validity);
             }
@@ -854,14 +859,14 @@ page_exit:
 static esp_err_t logs_json_get_handler(httpd_req_t *req)
 {
     esp_err_t err = ESP_OK;
-    sensor_log_entry_t *entries = calloc(NVS_SLOT_COUNT, sizeof(sensor_log_entry_t));
+    sensor_log_entry_t *entries = calloc(WEB_GRAPH_POINT_COUNT, sizeof(sensor_log_entry_t));
     if (!entries) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_sendstr(req, "{\"error\":\"Out of memory\"}");
         return ESP_ERR_NO_MEM;
     }
     bool from_sd = false;
-    size_t count = load_recent_entries(entries, NVS_SLOT_COUNT, &from_sd);
+    size_t count = load_recent_entries(entries, WEB_GRAPH_POINT_COUNT, &from_sd);
 
 #define SEND_JSON_CHUNK_OR_EXIT(chunk_literal_or_buf)                \
     do {                                                              \
@@ -876,7 +881,7 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
     char head[140];
     snprintf(head, sizeof(head), "{\"count\":%lu,\"capacity\":%u,\"source\":\"%s\",\"entries\":[",
              (unsigned long)count,
-             NVS_SLOT_COUNT,
+             WEB_GRAPH_POINT_COUNT,
              from_sd ? "sd" : "nvs");
     SEND_JSON_CHUNK_OR_EXIT(head);
 
