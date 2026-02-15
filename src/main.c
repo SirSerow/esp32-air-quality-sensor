@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -23,6 +24,10 @@
 #include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 
 // K0I05 components
 #include "ahtxx.h"
@@ -32,7 +37,13 @@
 // EEPROM
 
 static const char *TAG = "MAIN";
+static const char *TAG_SD = "SDCARD";
+static const char *TAG_NVS = "NVS";
+static const char *TAG_WIFI = "WIFI";
+static const char *TAG_TIME = "TIME";
 static httpd_handle_t s_http_server = NULL;
+static bool s_sd_ready = false;
+static sdmmc_card_t *s_sd_card = NULL;
 
 #define I2C_PORT        I2C_NUM_0
 #define I2C_SDA_GPIO    6
@@ -48,7 +59,16 @@ static httpd_handle_t s_http_server = NULL;
 #define STA_CONNECT_TIMEOUT_MS 20000
 #define NTP_SYNC_TIMEOUT_MS    20000
 
-#define SENSOR_READ_INTERVAL_MS 180000 // 3 minutes
+#define SENSOR_READ_INTERVAL_MS 1000 // 1 second
+
+// --- SPI pins for ESP32-C6-DevKitC-1 (recommended) ---
+#define PIN_NUM_MISO 21
+#define PIN_NUM_MOSI 22
+#define PIN_NUM_CLK  19
+#define PIN_NUM_CS   20
+
+#define MOUNT_POINT "/sdcard"
+#define LOG_PATH    MOUNT_POINT "/logs.csv"
 
 typedef struct {
     ahtxx_handle_t aht;
@@ -79,6 +99,170 @@ typedef struct {
     uint8_t has_aht;
     uint8_t has_ens;
 } sensor_log_entry_legacy_t;
+
+static bool parse_sensor_csv_line(const char *line, sensor_log_entry_t *out_entry)
+{
+    unsigned long unix_time = 0;
+    int temp_x100 = 0;
+    int humidity_x100 = 0;
+    unsigned int eco2_ppm = 0;
+    unsigned int tvoc_ppb = 0;
+    unsigned int aqi = 0;
+    unsigned int ens_validity = 0;
+    unsigned int has_aht = 0;
+    unsigned int has_ens = 0;
+
+    int fields = sscanf(line,
+                        "%lu,%d,%d,%u,%u,%u,%u,%u,%u",
+                        &unix_time,
+                        &temp_x100,
+                        &humidity_x100,
+                        &eco2_ppm,
+                        &tvoc_ppb,
+                        &aqi,
+                        &ens_validity,
+                        &has_aht,
+                        &has_ens);
+    if (fields != 9) {
+        return false;
+    }
+
+    out_entry->unix_time = (uint32_t)unix_time;
+    out_entry->temperature_c_x100 = (int16_t)temp_x100;
+    out_entry->humidity_pct_x100 = (int16_t)humidity_x100;
+    out_entry->eco2_ppm = (uint16_t)eco2_ppm;
+    out_entry->tvoc_ppb = (uint16_t)tvoc_ppb;
+    out_entry->aqi = (uint8_t)aqi;
+    out_entry->ens_validity = (uint8_t)ens_validity;
+    out_entry->has_aht = (uint8_t)has_aht;
+    out_entry->has_ens = (uint8_t)has_ens;
+    return true;
+}
+
+static void sd_log_debug_levels(void)
+{
+    ESP_LOGI(TAG_SD,
+             "SD pins: MISO=%d MOSI=%d CLK=%d CS=%d",
+             PIN_NUM_MISO,
+             PIN_NUM_MOSI,
+             PIN_NUM_CLK,
+             PIN_NUM_CS);
+    ESP_LOGI(TAG_SD,
+             "GPIO levels (pre-mount): MISO=%d MOSI=%d CLK=%d CS=%d",
+             gpio_get_level(PIN_NUM_MISO),
+             gpio_get_level(PIN_NUM_MOSI),
+             gpio_get_level(PIN_NUM_CLK),
+             gpio_get_level(PIN_NUM_CS));
+}
+
+static void sd_log_mount_hint(esp_err_t err)
+{
+    ESP_LOGW(TAG_SD, "Mount failed: %s (%d)", esp_err_to_name(err), (int)err);
+
+    if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG_SD, "Timeout usually means no SD response. Check CS/MISO/MOSI/CLK wiring and 3.3V power.");
+        ESP_LOGW(TAG_SD, "Also verify CS pin is unique and card/module uses 3.3V logic.");
+    } else if (err == ESP_FAIL) {
+        ESP_LOGW(TAG_SD, "Card responded but mount/init failed. Card format (FAT32) or module quality may be the cause.");
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG_SD, "SD/SPI host may already be initialized by another component.");
+    }
+}
+
+static esp_err_t sdcard_init_storage(void)
+{
+    ESP_LOGI(TAG_SD, "Initializing SD card via SDSPI...");
+    sd_log_debug_levels();
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    ESP_LOGI(TAG_SD, "SDSPI host slot=%d max_freq_khz=%d", host.slot, host.max_freq_khz);
+
+    esp_err_t err = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG_SD, "spi_bus_initialize failed: %s (%d)", esp_err_to_name(err), (int)err);
+        return err;
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG_SD, "SPI bus already initialized, continuing");
+    } else {
+        ESP_LOGI(TAG_SD, "SPI bus initialized");
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+    ESP_LOGI(TAG_SD, "SDSPI slot config: host_id=%d cs=%d", slot_config.host_id, slot_config.gpio_cs);
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+
+    ESP_LOGI(TAG_SD, "Mounting FATFS at %s", MOUNT_POINT);
+    err = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &s_sd_card);
+    if (err != ESP_OK) {
+        sd_log_mount_hint(err);
+        return err;
+    }
+
+    sdmmc_card_print_info(stdout, s_sd_card);
+    ESP_LOGI(TAG_SD, "SD card mounted successfully");
+
+    if (access(LOG_PATH, F_OK) != 0) {
+        ESP_LOGI(TAG_SD, "Log file not found, creating: %s", LOG_PATH);
+        FILE *f = fopen(LOG_PATH, "w");
+        if (!f) {
+            ESP_LOGE(TAG_SD, "Failed to create log file: %s", LOG_PATH);
+            return ESP_FAIL;
+        }
+        fprintf(f, "unix_time,temp_x100,humidity_x100,eco2_ppm,tvoc_ppb,aqi,ens_validity,has_aht,has_ens\n");
+        fclose(f);
+    } else {
+        ESP_LOGI(TAG_SD, "Using existing log file: %s", LOG_PATH);
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t sd_append_sensor_sample(const sensor_log_entry_t *entry)
+{
+    if (!s_sd_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    FILE *f = fopen(LOG_PATH, "a");
+    if (!f) {
+        return ESP_FAIL;
+    }
+
+    int n = fprintf(f,
+                    "%lu,%d,%d,%u,%u,%u,%u,%u,%u\n",
+                    (unsigned long)entry->unix_time,
+                    (int)entry->temperature_c_x100,
+                    (int)entry->humidity_pct_x100,
+                    (unsigned)entry->eco2_ppm,
+                    (unsigned)entry->tvoc_ppb,
+                    (unsigned)entry->aqi,
+                    (unsigned)entry->ens_validity,
+                    (unsigned)entry->has_aht,
+                    (unsigned)entry->has_ens);
+    fclose(f);
+
+    if (n < 0) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
 
 static esp_err_t network_stack_init_once(void)
 {
@@ -242,6 +426,9 @@ static esp_err_t nvs_init_storage(nvs_handle_t *out_nvs)
 
 static esp_err_t nvs_log_sensor_sample(nvs_handle_t nvs, const sensor_log_entry_t *entry)
 {
+    bool retried_after_reclaim = false;
+
+retry_write:
     uint32_t wr_idx = 0;
     uint32_t count = 0;
 
@@ -262,7 +449,23 @@ static esp_err_t nvs_log_sensor_sample(nvs_handle_t nvs, const sensor_log_entry_
     char slot_key[8];
     snprintf(slot_key, sizeof(slot_key), "r%03lu", (unsigned long)(wr_idx % NVS_SLOT_COUNT));
 
+    // Erase old entry first to help NVS garbage collector reclaim space
+    nvs_erase_key(nvs, slot_key);  // Ignore error if key doesn't exist
+
     err = nvs_set_blob(nvs, slot_key, entry, sizeof(*entry));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !retried_after_reclaim) {
+        ESP_LOGW(TAG, "NVS full while writing %s, erasing old log entries", slot_key);
+        err = nvs_erase_all(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_commit(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        retried_after_reclaim = true;
+        goto retry_write;
+    }
     if (err != ESP_OK) {
         return err;
     }
@@ -273,16 +476,57 @@ static esp_err_t nvs_log_sensor_sample(nvs_handle_t nvs, const sensor_log_entry_
     }
 
     err = nvs_set_u32(nvs, "wr_idx", wr_idx);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !retried_after_reclaim) {
+        ESP_LOGW(TAG, "NVS full while updating write index, erasing old log entries");
+        err = nvs_erase_all(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_commit(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        retried_after_reclaim = true;
+        goto retry_write;
+    }
     if (err != ESP_OK) {
         return err;
     }
 
     err = nvs_set_u32(nvs, "count", count);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !retried_after_reclaim) {
+        ESP_LOGW(TAG, "NVS full while updating count, erasing old log entries");
+        err = nvs_erase_all(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_commit(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        retried_after_reclaim = true;
+        goto retry_write;
+    }
     if (err != ESP_OK) {
         return err;
     }
 
-    return nvs_commit(nvs);
+    err = nvs_commit(nvs);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !retried_after_reclaim) {
+        ESP_LOGW(TAG, "NVS full on commit, erasing old log entries");
+        err = nvs_erase_all(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_commit(nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        retried_after_reclaim = true;
+        goto retry_write;
+    }
+
+    return err;
 }
 
 static esp_err_t nvs_get_u32_default(nvs_handle_t nvs, const char *key, uint32_t default_value, uint32_t *out_value)
@@ -338,6 +582,103 @@ static bool nvs_read_entry_compat(nvs_handle_t nvs, const char *key, sensor_log_
     return false;
 }
 
+static size_t load_recent_entries_from_nvs(sensor_log_entry_t *entries, size_t max_entries)
+{
+    if (max_entries == 0) {
+        return 0;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return 0;
+    }
+
+    uint32_t wr_idx = 0;
+    uint32_t count = 0;
+    err = nvs_get_u32_default(nvs, "wr_idx", 0, &wr_idx);
+    if (err == ESP_OK) {
+        err = nvs_get_u32_default(nvs, "count", 0, &count);
+    }
+    if (err != ESP_OK) {
+        nvs_close(nvs);
+        return 0;
+    }
+
+    if (count > NVS_SLOT_COUNT) {
+        count = NVS_SLOT_COUNT;
+    }
+
+    uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
+    size_t loaded = 0;
+    for (uint32_t i = 0; i < count && loaded < max_entries; i++) {
+        uint32_t slot = (start + i) % NVS_SLOT_COUNT;
+        char key[8];
+        snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
+
+        sensor_log_entry_t entry = {0};
+        if (!nvs_read_entry_compat(nvs, key, &entry)) {
+            continue;
+        }
+        entries[loaded++] = entry;
+    }
+
+    nvs_close(nvs);
+    return loaded;
+}
+
+static size_t load_recent_entries_from_sd(sensor_log_entry_t *entries, size_t max_entries)
+{
+    if (!s_sd_ready || max_entries == 0) {
+        return 0;
+    }
+
+    FILE *f = fopen(LOG_PATH, "r");
+    if (!f) {
+        return 0;
+    }
+
+    size_t loaded = 0;
+    char line[192];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "unix_time,", 10) == 0) {
+            continue;
+        }
+
+        sensor_log_entry_t entry = {0};
+        if (!parse_sensor_csv_line(line, &entry)) {
+            continue;
+        }
+
+        if (loaded < max_entries) {
+            entries[loaded++] = entry;
+        } else {
+            memmove(entries, &entries[1], (max_entries - 1) * sizeof(*entries));
+            entries[max_entries - 1] = entry;
+        }
+    }
+
+    fclose(f);
+    return loaded;
+}
+
+static size_t load_recent_entries(sensor_log_entry_t *entries, size_t max_entries, bool *from_sd)
+{
+    if (from_sd) {
+        *from_sd = false;
+    }
+
+    if (s_sd_ready) {
+        size_t count = load_recent_entries_from_sd(entries, max_entries);
+        if (from_sd) {
+            *from_sd = true;
+        }
+        return count;
+    }
+
+    return load_recent_entries_from_nvs(entries, max_entries);
+}
+
 static void format_unix_time(uint32_t unix_time, char *buf, size_t buf_len)
 {
     if (unix_time == 0) {
@@ -353,30 +694,15 @@ static void format_unix_time(uint32_t unix_time, char *buf, size_t buf_len)
 
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
 {
-    nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
+    esp_err_t err = ESP_OK;
+    sensor_log_entry_t *entries = calloc(NVS_SLOT_COUNT, sizeof(sensor_log_entry_t));
+    if (!entries) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "NVS unavailable");
-        return ESP_FAIL;
+        httpd_resp_sendstr(req, "Out of memory");
+        return ESP_ERR_NO_MEM;
     }
-
-    uint32_t wr_idx = 0;
-    uint32_t count = 0;
-    err = nvs_get_u32_default(nvs, "wr_idx", 0, &wr_idx);
-    if (err == ESP_OK) {
-        err = nvs_get_u32_default(nvs, "count", 0, &count);
-    }
-    if (err != ESP_OK) {
-        nvs_close(nvs);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "Failed to read log metadata");
-        return ESP_FAIL;
-    }
-
-    if (count > NVS_SLOT_COUNT) {
-        count = NVS_SLOT_COUNT;
-    }
+    bool from_sd = false;
+    size_t count = load_recent_entries(entries, NVS_SLOT_COUNT, &from_sd);
 
 #define SEND_CHUNK_OR_EXIT(chunk_literal_or_buf)                     \
     do {                                                              \
@@ -407,65 +733,60 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         "<div><b>ENS validity</b><br><canvas id='chart_validity' width='860' height='180'></canvas></div>"
         "</div><br>");
 
-    char meta[160];
-    snprintf(meta, sizeof(meta), "<p>Stored entries: %lu / %u</p>", (unsigned long)count, NVS_SLOT_COUNT);
+    char meta[200];
+    snprintf(meta, sizeof(meta), "<p>Stored entries: %lu / %u (%s)</p>",
+             (unsigned long)count,
+             NVS_SLOT_COUNT,
+             from_sd ? "SD card" : "NVS");
     SEND_CHUNK_OR_EXIT(meta);
 
     SEND_CHUNK_OR_EXIT(
         "<table border='1' cellspacing='0' cellpadding='6'>"
         "<tr><th>#</th><th>Time</th><th>T(C)</th><th>RH(%)</th><th>AQI</th><th>TVOC(ppb)</th><th>eCO2(ppm)</th><th>ENS validity</th></tr>");
 
-    uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t slot = (start + i) % NVS_SLOT_COUNT;
-        char key[8];
-        snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
-
-        sensor_log_entry_t entry = {0};
-        if (!nvs_read_entry_compat(nvs, key, &entry)) {
-            continue;
-        }
+    for (size_t i = 0; i < count; i++) {
+        const sensor_log_entry_t *entry = &entries[i];
 
         char row[400];
         char time_str[32];
-        format_unix_time(entry.unix_time, time_str, sizeof(time_str));
-        if (entry.has_aht) {
-            if (entry.has_ens) {
+        format_unix_time(entry->unix_time, time_str, sizeof(time_str));
+        if (entry->has_aht) {
+            if (entry->has_ens) {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
                          time_str,
-                         entry.temperature_c_x100 / 100.0f,
-                         entry.humidity_pct_x100 / 100.0f,
-                         entry.aqi,
-                         entry.tvoc_ppb,
-                         entry.eco2_ppm,
-                         entry.ens_validity);
+                         entry->temperature_c_x100 / 100.0f,
+                         entry->humidity_pct_x100 / 100.0f,
+                         entry->aqi,
+                         entry->tvoc_ppb,
+                         entry->eco2_ppm,
+                         entry->ens_validity);
             } else {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
                          time_str,
-                         entry.temperature_c_x100 / 100.0f,
-                         entry.humidity_pct_x100 / 100.0f,
-                         entry.ens_validity);
+                         entry->temperature_c_x100 / 100.0f,
+                         entry->humidity_pct_x100 / 100.0f,
+                         entry->ens_validity);
             }
         } else {
-            if (entry.has_ens) {
+            if (entry->has_ens) {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
                          time_str,
-                         entry.aqi,
-                         entry.tvoc_ppb,
-                         entry.eco2_ppm,
-                         entry.ens_validity);
+                         entry->aqi,
+                         entry->tvoc_ppb,
+                         entry->eco2_ppm,
+                         entry->ens_validity);
             } else {
                 snprintf(row, sizeof(row),
                          "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
                          (unsigned long)(i + 1),
                          time_str,
-                         entry.ens_validity);
+                         entry->ens_validity);
             }
         }
         SEND_CHUNK_OR_EXIT(row);
@@ -517,7 +838,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
     err = ESP_OK;
 
 page_exit:
-    nvs_close(nvs);
+    free(entries);
     if (err == ESP_OK) {
         esp_err_t end_err = httpd_resp_sendstr_chunk(req, NULL);
         if (end_err != ESP_OK) {
@@ -532,30 +853,15 @@ page_exit:
 
 static esp_err_t logs_json_get_handler(httpd_req_t *req)
 {
-    nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
+    esp_err_t err = ESP_OK;
+    sensor_log_entry_t *entries = calloc(NVS_SLOT_COUNT, sizeof(sensor_log_entry_t));
+    if (!entries) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "{\"error\":\"NVS unavailable\"}");
-        return ESP_FAIL;
+        httpd_resp_sendstr(req, "{\"error\":\"Out of memory\"}");
+        return ESP_ERR_NO_MEM;
     }
-
-    uint32_t wr_idx = 0;
-    uint32_t count = 0;
-    err = nvs_get_u32_default(nvs, "wr_idx", 0, &wr_idx);
-    if (err == ESP_OK) {
-        err = nvs_get_u32_default(nvs, "count", 0, &count);
-    }
-    if (err != ESP_OK) {
-        nvs_close(nvs);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "{\"error\":\"Failed to read log metadata\"}");
-        return ESP_FAIL;
-    }
-
-    if (count > NVS_SLOT_COUNT) {
-        count = NVS_SLOT_COUNT;
-    }
+    bool from_sd = false;
+    size_t count = load_recent_entries(entries, NVS_SLOT_COUNT, &from_sd);
 
 #define SEND_JSON_CHUNK_OR_EXIT(chunk_literal_or_buf)                \
     do {                                                              \
@@ -567,22 +873,16 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
 
-    char head[96];
-    snprintf(head, sizeof(head), "{\"count\":%lu,\"capacity\":%u,\"entries\":[",
-             (unsigned long)count, NVS_SLOT_COUNT);
+    char head[140];
+    snprintf(head, sizeof(head), "{\"count\":%lu,\"capacity\":%u,\"source\":\"%s\",\"entries\":[",
+             (unsigned long)count,
+             NVS_SLOT_COUNT,
+             from_sd ? "sd" : "nvs");
     SEND_JSON_CHUNK_OR_EXIT(head);
 
-    uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
     bool first = true;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t slot = (start + i) % NVS_SLOT_COUNT;
-        char key[8];
-        snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
-
-        sensor_log_entry_t entry = {0};
-        if (!nvs_read_entry_compat(nvs, key, &entry)) {
-            continue;
-        }
+    for (size_t i = 0; i < count; i++) {
+        const sensor_log_entry_t *entry = &entries[i];
 
         if (!first) {
             SEND_JSON_CHUNK_OR_EXIT(",");
@@ -594,15 +894,15 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
                  "{\"index\":%lu,\"unix_time\":%lu,\"has_aht\":%u,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,"
                  "\"has_ens\":%u,\"aqi\":%u,\"tvoc_ppb\":%u,\"eco2_ppm\":%u,\"ens_validity\":%u}",
                  (unsigned long)(i + 1),
-                 (unsigned long)entry.unix_time,
-                 entry.has_aht,
-                 entry.temperature_c_x100 / 100.0f,
-                 entry.humidity_pct_x100 / 100.0f,
-                 entry.has_ens,
-                 entry.aqi,
-                 entry.tvoc_ppb,
-                 entry.eco2_ppm,
-                 entry.ens_validity);
+                 (unsigned long)entry->unix_time,
+                 entry->has_aht,
+                 entry->temperature_c_x100 / 100.0f,
+                 entry->humidity_pct_x100 / 100.0f,
+                 entry->has_ens,
+                 entry->aqi,
+                 entry->tvoc_ppb,
+                 entry->eco2_ppm,
+                 entry->ens_validity);
         SEND_JSON_CHUNK_OR_EXIT(item);
     }
 
@@ -611,7 +911,7 @@ static esp_err_t logs_json_get_handler(httpd_req_t *req)
     err = ESP_OK;
 
 json_exit:
-    nvs_close(nvs);
+    free(entries);
     if (err == ESP_OK) {
         esp_err_t end_err = httpd_resp_sendstr_chunk(req, NULL);
         if (end_err != ESP_OK) {
@@ -628,6 +928,7 @@ static esp_err_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 4;
+    config.stack_size = 8192;
 
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
@@ -713,7 +1014,12 @@ static void loop_task(void *pvParameter)
             log_entry.ens_validity = (uint8_t)flag;
         }
 
-        if (s->nvs_ready) {
+        if (s_sd_ready) {
+            err = sd_append_sensor_sample(&log_entry);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "SD log write failed: %s", esp_err_to_name(err));
+            }
+        } else if (s->nvs_ready) {
             err = nvs_log_sensor_sample(s->nvs, &log_entry);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "NVS log write failed: %s", esp_err_to_name(err));
@@ -734,24 +1040,35 @@ void app_main(void)
     esp_err_t err = nvs_init_storage(&nvs);
     if (err == ESP_OK) {
         nvs_ready = true;
-        ESP_LOGI(TAG, "NVS logging enabled (%s)", NVS_NAMESPACE);
+        ESP_LOGI(TAG_NVS, "NVS logging enabled (%s)", NVS_NAMESPACE);
         nvs_log_stats();
     } else {
-        ESP_LOGW(TAG, "NVS init failed, continue without persistence: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG_NVS, "NVS init failed, continue without persistence: %s", esp_err_to_name(err));
+    }
+
+    err = sdcard_init_storage();
+    if (err == ESP_OK) {
+        s_sd_ready = true;
+        ESP_LOGI(TAG_SD, "SD card logging enabled (%s)", LOG_PATH);
+    } else {
+        s_sd_ready = false;
+        ESP_LOGW(TAG_SD, "SD card not available at startup, fallback to NVS: %s", esp_err_to_name(err));
+        // Add more logging about SD card failure here
+        ESP_LOGW(TAG_SD, "SD card init failed, error code: %d", err);
     }
 
     err = sync_time_via_sta();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Time sync before AP failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG_TIME, "Time sync before AP failed: %s", esp_err_to_name(err));
     }
 
     err = wifi_start_softap();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi AP start failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG_WIFI, "WiFi AP start failed: %s", esp_err_to_name(err));
     } else {
         err = start_webserver();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Web server start failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG_WIFI, "Web server start failed: %s", esp_err_to_name(err));
         }
     }
 
