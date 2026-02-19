@@ -723,7 +723,7 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         ".charts{display:grid;grid-template-columns:1fr;gap:10px;max-width:900px}"
         "canvas{border:1px solid #999;background:#fff}</style></head><body>"
         "<h1>Sensor Logs</h1>"
-        "<p>Live update: every 5s | JSON: <a href='/json'>/json</a></p>");
+        "<p>Live update: every 5s | JSON: <a href='/json'>/json</a> | CSV: <a href='/csv'>/csv</a></p>");
 
     SEND_CHUNK_OR_EXIT(
         "<div class='charts'>"
@@ -929,6 +929,81 @@ json_exit:
     return err;
 }
 
+static esp_err_t logs_csv_get_handler(httpd_req_t *req)
+{
+    esp_err_t err = ESP_OK;
+
+    httpd_resp_set_type(req, "text/csv; charset=utf-8");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=logs.csv");
+
+    if (s_sd_ready) {
+        FILE *f = fopen(LOG_PATH, "r");
+        if (!f) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "Failed to open CSV file");
+            return ESP_FAIL;
+        }
+
+        char buf[512];
+        while (fgets(buf, sizeof(buf), f)) {
+            err = httpd_resp_sendstr_chunk(req, buf);
+            if (err != ESP_OK) {
+                break;
+            }
+        }
+        fclose(f);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "HTTP csv send aborted: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        return httpd_resp_sendstr_chunk(req, NULL);
+    }
+
+    sensor_log_entry_t *entries = calloc(WEB_GRAPH_POINT_COUNT, sizeof(sensor_log_entry_t));
+    if (!entries) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t count = load_recent_entries_from_nvs(entries, WEB_GRAPH_POINT_COUNT);
+
+    err = httpd_resp_sendstr_chunk(req, "unix_time,temp_x100,humidity_x100,eco2_ppm,tvoc_ppb,aqi,ens_validity,has_aht,has_ens\n");
+    if (err != ESP_OK) {
+        free(entries);
+        ESP_LOGW(TAG, "HTTP csv header send aborted: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const sensor_log_entry_t *entry = &entries[i];
+        char row[200];
+        snprintf(row, sizeof(row),
+                 "%lu,%d,%d,%u,%u,%u,%u,%u,%u\n",
+                 (unsigned long)entry->unix_time,
+                 (int)entry->temperature_c_x100,
+                 (int)entry->humidity_pct_x100,
+                 (unsigned)entry->eco2_ppm,
+                 (unsigned)entry->tvoc_ppb,
+                 (unsigned)entry->aqi,
+                 (unsigned)entry->ens_validity,
+                 (unsigned)entry->has_aht,
+                 (unsigned)entry->has_ens);
+
+        err = httpd_resp_sendstr_chunk(req, row);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "HTTP csv send aborted: %s", esp_err_to_name(err));
+            free(entries);
+            return err;
+        }
+    }
+
+    free(entries);
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
 static esp_err_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -954,6 +1029,13 @@ static esp_err_t start_webserver(void)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t logs_csv_uri = {
+        .uri = "/csv",
+        .method = HTTP_GET,
+        .handler = logs_csv_get_handler,
+        .user_ctx = NULL,
+    };
+
     err = httpd_register_uri_handler(s_http_server, &logs_uri);
     if (err != ESP_OK) {
         httpd_stop(s_http_server);
@@ -962,6 +1044,13 @@ static esp_err_t start_webserver(void)
     }
 
     err = httpd_register_uri_handler(s_http_server, &logs_json_uri);
+    if (err != ESP_OK) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+        return err;
+    }
+
+    err = httpd_register_uri_handler(s_http_server, &logs_csv_uri);
     if (err != ESP_OK) {
         httpd_stop(s_http_server);
         s_http_server = NULL;
