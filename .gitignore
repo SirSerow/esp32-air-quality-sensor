@@ -6,3 +6,10 @@
 .vscode/*
 *.pdf
 src/secrets.h
+*autosave*
+*auto_save*
+*kicad_sch.lck*
+*fp-info-cache*
+.venv/
+*.csv
+*.png
