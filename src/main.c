@@ -80,6 +80,22 @@ static sdmmc_card_t *s_sd_card = NULL;
 #define WEB_GRAPH_POINT_COUNT 540
 #define WEB_TABLE_ROW_COUNT   10
 
+#define TEMP_OK_MIN_X100      2000
+#define TEMP_OK_MAX_X100      2700
+#define TEMP_WARN_MIN_X100    1800
+#define TEMP_WARN_MAX_X100    3000
+
+#define RH_OK_MIN_X100        4000
+#define RH_OK_MAX_X100        6000
+#define RH_WARN_MIN_X100      3000
+#define RH_WARN_MAX_X100      7000
+
+#define ECO2_OK_MAX           800
+#define ECO2_WARN_MAX         1200
+
+#define TVOC_OK_MAX           220
+#define TVOC_WARN_MAX         660
+
 typedef struct {
     ahtxx_handle_t aht;
     ens160_handle_t ens;
@@ -197,6 +213,7 @@ static void oled_font5x7(char c, uint8_t out[5])
     case 'A': memcpy(out, (uint8_t[5]){0x7E, 0x11, 0x11, 0x11, 0x7E}, 5); break;
     case 'C': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x22}, 5); break;
     case 'E': memcpy(out, (uint8_t[5]){0x7F, 0x49, 0x49, 0x49, 0x41}, 5); break;
+    case 'G': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x49, 0x49, 0x7A}, 5); break;
     case 'H': memcpy(out, (uint8_t[5]){0x7F, 0x08, 0x08, 0x08, 0x7F}, 5); break;
     case 'I': memcpy(out, (uint8_t[5]){0x00, 0x41, 0x7F, 0x41, 0x00}, 5); break;
     case 'O': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x3E}, 5); break;
@@ -204,6 +221,7 @@ static void oled_font5x7(char c, uint8_t out[5])
     case 'R': memcpy(out, (uint8_t[5]){0x7F, 0x09, 0x19, 0x29, 0x46}, 5); break;
     case 'T': memcpy(out, (uint8_t[5]){0x01, 0x01, 0x7F, 0x01, 0x01}, 5); break;
     case 'V': memcpy(out, (uint8_t[5]){0x1F, 0x20, 0x40, 0x20, 0x1F}, 5); break;
+    case 'Y': memcpy(out, (uint8_t[5]){0x03, 0x04, 0x78, 0x04, 0x03}, 5); break;
     case ':': memcpy(out, (uint8_t[5]){0x00, 0x36, 0x36, 0x00, 0x00}, 5); break;
     case '.': memcpy(out, (uint8_t[5]){0x00, 0x40, 0x60, 0x00, 0x00}, 5); break;
     case '%': memcpy(out, (uint8_t[5]){0x63, 0x13, 0x08, 0x64, 0x63}, 5); break;
@@ -296,21 +314,87 @@ static esp_err_t oled_render_entry(const sensor_log_entry_t *entry)
     char line2[22];
     char line3[22];
     char line4[22];
+    char temp_code = '-';
+    char rh_code = '-';
+    char aqi_code = '-';
+    char tvoc_code = '-';
+    char eco2_code = '-';
+    char validity_code = '-';
+
+    time_t now = 0;
+    time(&now);
+    if (now > 1700000000) {
+        struct tm tm_local;
+        localtime_r(&now, &tm_local);
+        strftime(line1, sizeof(line1), "%y-%m-%d %H:%M", &tm_local);
+    } else {
+        snprintf(line1, sizeof(line1), "--/-- --:--");
+    }
 
     if (entry->has_aht) {
-        snprintf(line1, sizeof(line1), "T:%.2fC", entry->temperature_c_x100 / 100.0f);
-        snprintf(line2, sizeof(line2), "RH:%.2f%%", entry->humidity_pct_x100 / 100.0f);
+        if (entry->temperature_c_x100 >= TEMP_OK_MIN_X100 && entry->temperature_c_x100 <= TEMP_OK_MAX_X100) {
+            temp_code = 'G';
+        } else if (entry->temperature_c_x100 >= TEMP_WARN_MIN_X100 && entry->temperature_c_x100 <= TEMP_WARN_MAX_X100) {
+            temp_code = 'Y';
+        } else {
+            temp_code = 'R';
+        }
+
+        if (entry->humidity_pct_x100 >= RH_OK_MIN_X100 && entry->humidity_pct_x100 <= RH_OK_MAX_X100) {
+            rh_code = 'G';
+        } else if (entry->humidity_pct_x100 >= RH_WARN_MIN_X100 && entry->humidity_pct_x100 <= RH_WARN_MAX_X100) {
+            rh_code = 'Y';
+        } else {
+            rh_code = 'R';
+        }
+
+        snprintf(line2, sizeof(line2), "T:%.1f%c H:%.1f%c",
+                 entry->temperature_c_x100 / 100.0f,
+                 temp_code,
+                 entry->humidity_pct_x100 / 100.0f,
+                 rh_code);
     } else {
-        snprintf(line1, sizeof(line1), "T:-");
-        snprintf(line2, sizeof(line2), "RH:-");
+        snprintf(line2, sizeof(line2), "T:- H:-");
+    }
+
+    if (entry->ens_validity == 0) {
+        validity_code = 'G';
+    } else if (entry->ens_validity == 1) {
+        validity_code = 'Y';
+    } else {
+        validity_code = 'R';
     }
 
     if (entry->has_ens) {
-        snprintf(line3, sizeof(line3), "AQI:%u TVOC:%u", entry->aqi, entry->tvoc_ppb);
-        snprintf(line4, sizeof(line4), "ECO2:%u V:%u", entry->eco2_ppm, entry->ens_validity);
+        if (entry->aqi <= 2) {
+            aqi_code = 'G';
+        } else if (entry->aqi == 3) {
+            aqi_code = 'Y';
+        } else {
+            aqi_code = 'R';
+        }
+
+        if (entry->tvoc_ppb <= TVOC_OK_MAX) {
+            tvoc_code = 'G';
+        } else if (entry->tvoc_ppb <= TVOC_WARN_MAX) {
+            tvoc_code = 'Y';
+        } else {
+            tvoc_code = 'R';
+        }
+
+        if (entry->eco2_ppm <= ECO2_OK_MAX) {
+            eco2_code = 'G';
+        } else if (entry->eco2_ppm <= ECO2_WARN_MAX) {
+            eco2_code = 'Y';
+        } else {
+            eco2_code = 'R';
+        }
+
+        snprintf(line3, sizeof(line3), "A:%u%c T:%u%c", entry->aqi, aqi_code, entry->tvoc_ppb, tvoc_code);
+        snprintf(line4, sizeof(line4), "C:%u%c V:%u%c", entry->eco2_ppm, eco2_code, entry->ens_validity, validity_code);
     } else {
-        snprintf(line3, sizeof(line3), "AQI:- TVOC:-");
-        snprintf(line4, sizeof(line4), "ECO2:- V:%u", entry->ens_validity);
+        snprintf(line3, sizeof(line3), "A:- T:-");
+        snprintf(line4, sizeof(line4), "C:- V:%u%c", entry->ens_validity, validity_code);
     }
 
     oled_draw_text(framebuffer, 0, 0, line1);
@@ -1017,6 +1101,90 @@ static void format_unix_time(uint32_t unix_time, char *buf, size_t buf_len)
     strftime(buf, buf_len, "%Y-%m-%d %H:%M:%S JST", &tm_local);
 }
 
+typedef enum {
+    VALUE_SEVERITY_OK = 0,
+    VALUE_SEVERITY_WARN,
+    VALUE_SEVERITY_BAD,
+    VALUE_SEVERITY_NA,
+} value_severity_t;
+
+static const char *severity_css_class(value_severity_t severity)
+{
+    switch (severity) {
+    case VALUE_SEVERITY_OK: return "v-ok";
+    case VALUE_SEVERITY_WARN: return "v-warn";
+    case VALUE_SEVERITY_BAD: return "v-bad";
+    case VALUE_SEVERITY_NA:
+    default: return "v-na";
+    }
+}
+
+static value_severity_t temperature_severity(int16_t temp_x100)
+{
+    if (temp_x100 >= TEMP_OK_MIN_X100 && temp_x100 <= TEMP_OK_MAX_X100) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (temp_x100 >= TEMP_WARN_MIN_X100 && temp_x100 <= TEMP_WARN_MAX_X100) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
+static value_severity_t humidity_severity(int16_t rh_x100)
+{
+    if (rh_x100 >= RH_OK_MIN_X100 && rh_x100 <= RH_OK_MAX_X100) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (rh_x100 >= RH_WARN_MIN_X100 && rh_x100 <= RH_WARN_MAX_X100) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
+static value_severity_t aqi_severity(uint8_t aqi)
+{
+    if (aqi <= 2) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (aqi == 3) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
+static value_severity_t tvoc_severity(uint16_t tvoc)
+{
+    if (tvoc <= TVOC_OK_MAX) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (tvoc <= TVOC_WARN_MAX) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
+static value_severity_t eco2_severity(uint16_t eco2)
+{
+    if (eco2 <= ECO2_OK_MAX) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (eco2 <= ECO2_WARN_MAX) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
+static value_severity_t ens_validity_severity(uint8_t validity)
+{
+    if (validity == 0) {
+        return VALUE_SEVERITY_OK;
+    }
+    if (validity == 1) {
+        return VALUE_SEVERITY_WARN;
+    }
+    return VALUE_SEVERITY_BAD;
+}
+
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
 {
     esp_err_t err = ESP_OK;
@@ -1044,7 +1212,12 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
         "<title>Sensor Logs</title>"
         "<style>body{font-family:Arial,sans-serif;margin:12px}"
         ".charts{display:grid;grid-template-columns:1fr;gap:10px;max-width:900px}"
-        "canvas{border:1px solid #999;background:#fff}</style></head><body>"
+        "canvas{border:1px solid #999;background:#fff}"
+        "table{border-collapse:collapse}th,td{padding:6px}"
+        ".v-ok{color:#198754;font-weight:700}"
+        ".v-warn{color:#b58900;font-weight:700}"
+        ".v-bad{color:#d1242f;font-weight:700}"
+        ".v-na{color:#666}</style></head><body>"
         "<h1>Sensor Logs</h1>"
         "<p>Live update: every 5s | JSON: <a href='/json'>/json</a> | CSV: <a href='/csv'>/csv</a></p>");
 
@@ -1075,48 +1248,54 @@ static esp_err_t logs_page_get_handler(httpd_req_t *req)
     for (size_t i = table_start; i < count; i++) {
         const sensor_log_entry_t *entry = &entries[i];
 
-        char row[400];
+        char row[560];
         char time_str[32];
+        char temp_str[16] = "-";
+        char rh_str[16] = "-";
+        char aqi_str[16] = "-";
+        char tvoc_str[16] = "-";
+        char eco2_str[16] = "-";
+        char validity_str[16];
+        const char *temp_class = "v-na";
+        const char *rh_class = "v-na";
+        const char *aqi_class = "v-na";
+        const char *tvoc_class = "v-na";
+        const char *eco2_class = "v-na";
+        const char *validity_class = severity_css_class(ens_validity_severity(entry->ens_validity));
+
         format_unix_time(entry->unix_time, time_str, sizeof(time_str));
+
         if (entry->has_aht) {
-            if (entry->has_ens) {
-                snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
-                         (unsigned long)(i - table_start + 1),
-                         time_str,
-                         entry->temperature_c_x100 / 100.0f,
-                         entry->humidity_pct_x100 / 100.0f,
-                         entry->aqi,
-                         entry->tvoc_ppb,
-                         entry->eco2_ppm,
-                         entry->ens_validity);
-            } else {
-                snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%s</td><td>%.2f</td><td>%.2f</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
-                         (unsigned long)(i - table_start + 1),
-                         time_str,
-                         entry->temperature_c_x100 / 100.0f,
-                         entry->humidity_pct_x100 / 100.0f,
-                         entry->ens_validity);
-            }
-        } else {
-            if (entry->has_ens) {
-                snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>%u</td><td>%u</td><td>%u</td><td>%u</td></tr>",
-                         (unsigned long)(i - table_start + 1),
-                         time_str,
-                         entry->aqi,
-                         entry->tvoc_ppb,
-                         entry->eco2_ppm,
-                         entry->ens_validity);
-            } else {
-                snprintf(row, sizeof(row),
-                         "<tr><td>%lu</td><td>%s</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>%u</td></tr>",
-                         (unsigned long)(i - table_start + 1),
-                         time_str,
-                         entry->ens_validity);
-            }
+            snprintf(temp_str, sizeof(temp_str), "%.2f", entry->temperature_c_x100 / 100.0f);
+            snprintf(rh_str, sizeof(rh_str), "%.2f", entry->humidity_pct_x100 / 100.0f);
+            temp_class = severity_css_class(temperature_severity(entry->temperature_c_x100));
+            rh_class = severity_css_class(humidity_severity(entry->humidity_pct_x100));
         }
+
+        if (entry->has_ens) {
+            snprintf(aqi_str, sizeof(aqi_str), "%u", entry->aqi);
+            snprintf(tvoc_str, sizeof(tvoc_str), "%u", entry->tvoc_ppb);
+            snprintf(eco2_str, sizeof(eco2_str), "%u", entry->eco2_ppm);
+            aqi_class = severity_css_class(aqi_severity(entry->aqi));
+            tvoc_class = severity_css_class(tvoc_severity(entry->tvoc_ppb));
+            eco2_class = severity_css_class(eco2_severity(entry->eco2_ppm));
+        }
+
+        snprintf(validity_str, sizeof(validity_str), "%u", entry->ens_validity);
+
+        snprintf(row, sizeof(row),
+                 "<tr><td>%lu</td><td>%s</td>"
+                 "<td class='%s'>%s</td><td class='%s'>%s</td>"
+                 "<td class='%s'>%s</td><td class='%s'>%s</td><td class='%s'>%s</td>"
+                 "<td class='%s'>%s</td></tr>",
+                 (unsigned long)(i - table_start + 1),
+                 time_str,
+                 temp_class, temp_str,
+                 rh_class, rh_str,
+                 aqi_class, aqi_str,
+                 tvoc_class, tvoc_str,
+                 eco2_class, eco2_str,
+                 validity_class, validity_str);
         SEND_CHUNK_OR_EXIT(row);
     }
 
