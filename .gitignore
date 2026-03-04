@@ -13,3 +13,6 @@ src/secrets.h
 .venv/
 *.csv
 *.png
+*sensor-pcb/output/
+*sensor-pcb-backups
+*.lck

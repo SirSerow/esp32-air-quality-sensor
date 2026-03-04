@@ -10,10 +10,12 @@
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // Logging / errors
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_check.h"
 
 // ESP-IDF 5.x I2C master-bus API (IMPORTANT)
 #include "driver/i2c_master.h"
@@ -41,6 +43,7 @@ static const char *TAG_SD = "SDCARD";
 static const char *TAG_NVS = "NVS";
 static const char *TAG_WIFI = "WIFI";
 static const char *TAG_TIME = "TIME";
+static const char *TAG_OLED = "OLED";
 static httpd_handle_t s_http_server = NULL;
 static bool s_sd_ready = false;
 static sdmmc_card_t *s_sd_card = NULL;
@@ -49,6 +52,11 @@ static sdmmc_card_t *s_sd_card = NULL;
 #define I2C_SDA_GPIO    6
 #define I2C_SCL_GPIO    7
 #define I2C_FREQ_HZ     100000
+#define OLED_I2C_ADDR   0x3C
+#define OLED_WIDTH      128
+#define OLED_HEIGHT     64
+#define OLED_PAGE_COUNT (OLED_HEIGHT / 8)
+#define OLED_BUTTON_GPIO 5
 
 #define NVS_NAMESPACE       "sensorlog"
 #define NVS_SLOT_COUNT      180
@@ -101,6 +109,321 @@ typedef struct {
     uint8_t has_aht;
     uint8_t has_ens;
 } sensor_log_entry_legacy_t;
+
+static i2c_master_dev_handle_t s_oled_dev = NULL;
+static bool s_oled_available = false;
+static bool s_oled_enabled = true;
+static volatile bool s_oled_toggle_requested = false;
+static volatile TickType_t s_button_last_tick = 0;
+static SemaphoreHandle_t s_latest_entry_mutex = NULL;
+static sensor_log_entry_t s_latest_entry = {0};
+static bool s_latest_entry_valid = false;
+
+static esp_err_t oled_send_command(uint8_t command)
+{
+    if (!s_oled_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t payload[2] = {0x00, command};
+    return i2c_master_transmit(s_oled_dev, payload, sizeof(payload), -1);
+}
+
+static esp_err_t oled_set_power(bool enabled)
+{
+    return oled_send_command(enabled ? 0xAF : 0xAE);
+}
+
+static esp_err_t oled_clear(void)
+{
+    if (!s_oled_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t data[OLED_WIDTH + 1] = {0};
+    data[0] = 0x40;
+
+    for (uint8_t page = 0; page < OLED_PAGE_COUNT; page++) {
+        esp_err_t err = oled_send_command((uint8_t)(0xB0 + page));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set page failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = oled_send_command(0x00);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set low col failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = oled_send_command(0x10);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set high col failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = i2c_master_transmit(s_oled_dev, data, sizeof(data), -1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "clear data failed: %s", esp_err_to_name(err));
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void oled_font5x7(char c, uint8_t out[5])
+{
+    memset(out, 0, 5);
+
+    if (c >= '0' && c <= '9') {
+        static const uint8_t digits[10][5] = {
+            {0x3E, 0x51, 0x49, 0x45, 0x3E},
+            {0x00, 0x42, 0x7F, 0x40, 0x00},
+            {0x62, 0x51, 0x49, 0x49, 0x46},
+            {0x22, 0x49, 0x49, 0x49, 0x36},
+            {0x18, 0x14, 0x12, 0x7F, 0x10},
+            {0x2F, 0x49, 0x49, 0x49, 0x31},
+            {0x3E, 0x49, 0x49, 0x49, 0x32},
+            {0x01, 0x71, 0x09, 0x05, 0x03},
+            {0x36, 0x49, 0x49, 0x49, 0x36},
+            {0x26, 0x49, 0x49, 0x49, 0x3E},
+        };
+        memcpy(out, digits[c - '0'], 5);
+        return;
+    }
+
+    switch (c) {
+    case 'A': memcpy(out, (uint8_t[5]){0x7E, 0x11, 0x11, 0x11, 0x7E}, 5); break;
+    case 'C': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x22}, 5); break;
+    case 'E': memcpy(out, (uint8_t[5]){0x7F, 0x49, 0x49, 0x49, 0x41}, 5); break;
+    case 'H': memcpy(out, (uint8_t[5]){0x7F, 0x08, 0x08, 0x08, 0x7F}, 5); break;
+    case 'I': memcpy(out, (uint8_t[5]){0x00, 0x41, 0x7F, 0x41, 0x00}, 5); break;
+    case 'O': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x3E}, 5); break;
+    case 'Q': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x51, 0x21, 0x5E}, 5); break;
+    case 'R': memcpy(out, (uint8_t[5]){0x7F, 0x09, 0x19, 0x29, 0x46}, 5); break;
+    case 'T': memcpy(out, (uint8_t[5]){0x01, 0x01, 0x7F, 0x01, 0x01}, 5); break;
+    case 'V': memcpy(out, (uint8_t[5]){0x1F, 0x20, 0x40, 0x20, 0x1F}, 5); break;
+    case ':': memcpy(out, (uint8_t[5]){0x00, 0x36, 0x36, 0x00, 0x00}, 5); break;
+    case '.': memcpy(out, (uint8_t[5]){0x00, 0x40, 0x60, 0x00, 0x00}, 5); break;
+    case '%': memcpy(out, (uint8_t[5]){0x63, 0x13, 0x08, 0x64, 0x63}, 5); break;
+    case '-': memcpy(out, (uint8_t[5]){0x08, 0x08, 0x08, 0x08, 0x08}, 5); break;
+    case ' ': default: break;
+    }
+}
+
+static void oled_draw_text(uint8_t *framebuffer, int x, int y, const char *text)
+{
+    if (!framebuffer || !text) {
+        return;
+    }
+
+    for (const char *p = text; *p != '\0'; p++, x += 6) {
+        if (x > (OLED_WIDTH - 6)) {
+            break;
+        }
+
+        uint8_t glyph[5] = {0};
+        oled_font5x7(*p, glyph);
+
+        for (int col = 0; col < 5; col++) {
+            for (int row = 0; row < 7; row++) {
+                if ((glyph[col] >> row) & 0x01) {
+                    int px = x + col;
+                    int py = y + row;
+                    if (px < 0 || px >= OLED_WIDTH || py < 0 || py >= OLED_HEIGHT) {
+                        continue;
+                    }
+                    framebuffer[px + (py / 8) * OLED_WIDTH] |= (uint8_t)(1U << (py % 8));
+                }
+            }
+        }
+    }
+}
+
+static esp_err_t oled_flush(const uint8_t *framebuffer)
+{
+    if (!s_oled_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!framebuffer) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t tx[OLED_WIDTH + 1];
+    tx[0] = 0x40;
+
+    for (uint8_t page = 0; page < OLED_PAGE_COUNT; page++) {
+        esp_err_t err = oled_send_command((uint8_t)(0xB0 + page));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set page failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = oled_send_command(0x00);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set low col failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        err = oled_send_command(0x10);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "set high col failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        memcpy(&tx[1], &framebuffer[page * OLED_WIDTH], OLED_WIDTH);
+        err = i2c_master_transmit(s_oled_dev, tx, sizeof(tx), -1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_OLED, "frame transmit failed: %s", esp_err_to_name(err));
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t oled_render_entry(const sensor_log_entry_t *entry)
+{
+    if (!entry) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t framebuffer[OLED_WIDTH * OLED_PAGE_COUNT];
+    memset(framebuffer, 0, sizeof(framebuffer));
+
+    char line1[22];
+    char line2[22];
+    char line3[22];
+    char line4[22];
+
+    if (entry->has_aht) {
+        snprintf(line1, sizeof(line1), "T:%.2fC", entry->temperature_c_x100 / 100.0f);
+        snprintf(line2, sizeof(line2), "RH:%.2f%%", entry->humidity_pct_x100 / 100.0f);
+    } else {
+        snprintf(line1, sizeof(line1), "T:-");
+        snprintf(line2, sizeof(line2), "RH:-");
+    }
+
+    if (entry->has_ens) {
+        snprintf(line3, sizeof(line3), "AQI:%u TVOC:%u", entry->aqi, entry->tvoc_ppb);
+        snprintf(line4, sizeof(line4), "ECO2:%u V:%u", entry->eco2_ppm, entry->ens_validity);
+    } else {
+        snprintf(line3, sizeof(line3), "AQI:- TVOC:-");
+        snprintf(line4, sizeof(line4), "ECO2:- V:%u", entry->ens_validity);
+    }
+
+    oled_draw_text(framebuffer, 0, 0, line1);
+    oled_draw_text(framebuffer, 0, 16, line2);
+    oled_draw_text(framebuffer, 0, 32, line3);
+    oled_draw_text(framebuffer, 0, 48, line4);
+
+    return oled_flush(framebuffer);
+}
+
+static esp_err_t oled_init(i2c_master_bus_handle_t bus)
+{
+    if (!bus) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    i2c_device_config_t oled_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = OLED_I2C_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+
+    esp_err_t err = i2c_master_bus_add_device(bus, &oled_cfg, &s_oled_dev);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const uint8_t init_seq[] = {
+        0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+        0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12,
+        0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6,
+        0x2E, 0xAF,
+    };
+
+    for (size_t i = 0; i < sizeof(init_seq); i++) {
+        err = oled_send_command(init_seq[i]);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return oled_clear();
+}
+
+static void IRAM_ATTR oled_button_isr_handler(void *arg)
+{
+    (void)arg;
+    TickType_t now = xTaskGetTickCountFromISR();
+    if ((now - s_button_last_tick) >= pdMS_TO_TICKS(200)) {
+        s_button_last_tick = now;
+        s_oled_toggle_requested = true;
+    }
+}
+
+static esp_err_t oled_button_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << OLED_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
+    return gpio_isr_handler_add(OLED_BUTTON_GPIO, oled_button_isr_handler, NULL);
+}
+
+static void display_task(void *pvParameter)
+{
+    (void)pvParameter;
+
+    while (1) {
+        if (s_oled_toggle_requested) {
+            s_oled_toggle_requested = false;
+            s_oled_enabled = !s_oled_enabled;
+            esp_err_t pwr_err = oled_set_power(s_oled_enabled);
+            if (pwr_err != ESP_OK) {
+                ESP_LOGW(TAG_OLED, "OLED power toggle failed: %s", esp_err_to_name(pwr_err));
+            } else {
+                ESP_LOGI(TAG_OLED, "OLED %s", s_oled_enabled ? "ON" : "OFF");
+            }
+        }
+
+        if (s_oled_enabled && s_oled_available) {
+            sensor_log_entry_t snapshot = {0};
+            bool has_data = false;
+            if (s_latest_entry_mutex && xSemaphoreTake(s_latest_entry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                snapshot = s_latest_entry;
+                has_data = s_latest_entry_valid;
+                xSemaphoreGive(s_latest_entry_mutex);
+            }
+
+            if (has_data) {
+                esp_err_t draw_err = oled_render_entry(&snapshot);
+                if (draw_err != ESP_OK) {
+                    ESP_LOGW(TAG_OLED, "OLED render failed: %s", esp_err_to_name(draw_err));
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 static bool parse_sensor_csv_line(const char *line, sensor_log_entry_t *out_entry)
 {
@@ -1120,6 +1443,12 @@ static void loop_task(void *pvParameter)
             }
         }
 
+        if (s_latest_entry_mutex && xSemaphoreTake(s_latest_entry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            s_latest_entry = log_entry;
+            s_latest_entry_valid = true;
+            xSemaphoreGive(s_latest_entry_mutex);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL_MS));
     }
 }
@@ -1190,6 +1519,29 @@ void app_main(void)
     ens160_handle_t ens = NULL;
     ens160_init(bus, &ens_cfg, &ens);
     assert(ens);
+
+    s_latest_entry_mutex = xSemaphoreCreateMutex();
+    if (!s_latest_entry_mutex) {
+        ESP_LOGW(TAG_OLED, "Failed to create latest-entry mutex; OLED updates may be skipped");
+    }
+
+    err = oled_init(bus);
+    if (err == ESP_OK) {
+        s_oled_available = true;
+        ESP_LOGI(TAG_OLED, "SSD1306 OLED initialized at 0x%02X", OLED_I2C_ADDR);
+
+        err = oled_button_init();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG_OLED, "Button init failed on GPIO %d: %s", OLED_BUTTON_GPIO, esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG_OLED, "Button configured on GPIO %d (active-low, press to toggle OLED)", OLED_BUTTON_GPIO);
+        }
+
+        xTaskCreate(display_task, "display_task", 4096, NULL, 4, NULL);
+    } else {
+        s_oled_available = false;
+        ESP_LOGW(TAG_OLED, "OLED init failed, continuing without display: %s", esp_err_to_name(err));
+    }
 
     // 4) Start loop task
     static sensors_t sensors;
