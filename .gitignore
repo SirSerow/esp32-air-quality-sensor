@@ -12,7 +12,7 @@ src/secrets.h
 *fp-info-cache*
 .venv/
 *.csv
-*.png
 *sensor-pcb/output/
 *sensor-pcb-backups
 *.lck
+*graphs/
