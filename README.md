@@ -27,8 +27,9 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 - Web dashboard at `/` with:
   - Live-updating table of stored values
   - Separate graph for each metric
-- JSON API at `/json` for easier parsing/integration.
+- JSON API at `/json` for the built-in dashboard recent window.
 - CSV download endpoint at `/csv`.
+- Versioned server sync API under `/api/v1` for status, time-bounded history, and incremental polling.
 - Optional NTP sync via STA credentials before AP startup.
 
 ## Default Runtime Configuration
@@ -37,6 +38,9 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 - AP URL: `http://192.168.4.1/`
 - JSON endpoint: `http://192.168.4.1/json`
 - CSV endpoint: `http://192.168.4.1/csv`
+- Server status endpoint: `http://192.168.4.1/api/v1/status`
+- Server records endpoint: `http://192.168.4.1/api/v1/records`
+- Server sync endpoint: `http://192.168.4.1/api/v1/sync`
 - Sampling interval: 1 minute (`SENSOR_READ_INTERVAL_MS = 60000`)
 - NVS ring-buffer capacity: 180 points (`NVS_SLOT_COUNT = 180`)
 - SD log file path: `/sdcard/logs.csv`
@@ -67,7 +71,8 @@ platformio device monitor -b 115200
 3. Open:
    - Dashboard: `http://192.168.4.1/`
    - JSON: `http://192.168.4.1/json`
-  - CSV: `http://192.168.4.1/csv`
+   - CSV: `http://192.168.4.1/csv`
+   - Server API status: `http://192.168.4.1/api/v1/status`
 
 Dashboard preview:
 ![Final result web GUI](images/user_web_gui.jpg)
@@ -85,6 +90,65 @@ Dashboard preview:
 - If SD mount succeeds, logs are appended to `/sdcard/logs.csv`.
 - If SD mount fails, logging continues in NVS (`sensorlog` namespace).
 - Web graph/table endpoints read from SD when available, otherwise from NVS.
+
+## Server API
+The server-facing API is separate from the dashboard endpoints and is intended for periodic polling by another service.
+
+General behavior:
+- All `/api/v1/*` endpoints return JSON.
+- Historical results are ordered oldest to newest.
+- Records with `unix_time = 0` are excluded from `/api/v1/*`.
+- Storage source is reported as `"sd"` or `"nvs"`.
+
+### `GET /api/v1/status`
+Returns current device metadata and the newest valid-timestamp record.
+
+Example fields:
+- `device_time_unix`
+- `sample_interval_sec`
+- `storage_source`
+- `sd_ready`
+- `nvs_ready`
+- `latest_record`
+
+### `GET /api/v1/records`
+Returns a bounded history window.
+
+Query parameters:
+- `from`: optional inclusive unix timestamp
+- `to`: optional inclusive unix timestamp
+- `limit`: optional number of rows, default `120`, max `240`
+
+Behavior:
+- With no `from` and no `to`, returns the newest `limit` records.
+- With `from` and/or `to`, returns the matching chronological slice.
+- Response includes `count`, `limit`, `has_more`, `source`, `from`, `to`, and `entries`.
+
+Examples:
+- Newest 60 rows: `/api/v1/records?limit=60`
+- Last day starting at a timestamp: `/api/v1/records?from=1712800000`
+- Bounded range: `/api/v1/records?from=1712800000&to=1712886400&limit=120`
+
+### `GET /api/v1/sync`
+Returns records newer than a server-held cursor for efficient incremental sync.
+
+Query parameters:
+- `since`: optional exclusive unix timestamp cursor, default `0`
+- `limit`: optional batch size, default `120`, max `240`
+
+Response fields:
+- `count`
+- `limit`
+- `has_more`
+- `next_since`
+- `source`
+- `entries`
+
+Polling model:
+1. Call `/api/v1/sync?since=0` for the initial import.
+2. Store the returned `next_since` value after successfully ingesting the batch.
+3. If `has_more` is `true`, call `/api/v1/sync?since=<next_since>` again immediately.
+4. Otherwise wait until the next polling interval.
 
 ## KiCad Schematic & PCB Design
 The hardware was designed in KiCad and includes:

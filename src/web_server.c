@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -96,6 +97,402 @@ static value_severity_t ens_validity_severity(uint8_t validity)
         return VALUE_SEVERITY_WARN;
     }
     return VALUE_SEVERITY_BAD;
+}
+
+static const char *storage_source_name(bool from_sd)
+{
+    return from_sd ? "sd" : "nvs";
+}
+
+static esp_err_t send_json_error(httpd_req_t *req, const char *status, const char *message)
+{
+    char body[160];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t send_json_entry_chunk(httpd_req_t *req, const sensor_log_entry_t *entry, size_t index)
+{
+    char item[320];
+    snprintf(item, sizeof(item),
+             "{\"index\":%lu,\"unix_time\":%lu,\"has_aht\":%u,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,"
+             "\"has_ens\":%u,\"aqi\":%u,\"tvoc_ppb\":%u,\"eco2_ppm\":%u,\"ens_validity\":%u}",
+             (unsigned long)index,
+             (unsigned long)entry->unix_time,
+             entry->has_aht,
+             entry->temperature_c_x100 / 100.0f,
+             entry->humidity_pct_x100 / 100.0f,
+             entry->has_ens,
+             entry->aqi,
+             entry->tvoc_ppb,
+             entry->eco2_ppm,
+             entry->ens_validity);
+    return httpd_resp_sendstr_chunk(req, item);
+}
+
+static char *alloc_query_string(httpd_req_t *req)
+{
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0) {
+        return NULL;
+    }
+
+    char *query = calloc(query_len + 1, sizeof(char));
+    if (!query) {
+        return NULL;
+    }
+
+    if (httpd_req_get_url_query_str(req, query, query_len + 1) != ESP_OK) {
+        free(query);
+        return NULL;
+    }
+
+    return query;
+}
+
+static bool parse_u32_string(const char *value, uint32_t *out_value)
+{
+    if (!value || !*value || !out_value) {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (*end != '\0' || parsed > UINT32_MAX) {
+        return false;
+    }
+
+    *out_value = (uint32_t)parsed;
+    return true;
+}
+
+static bool parse_size_string(const char *value, size_t *out_value)
+{
+    if (!value || !*value || !out_value) {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (*end != '\0') {
+        return false;
+    }
+
+    *out_value = (size_t)parsed;
+    return true;
+}
+
+static esp_err_t query_get_optional_u32(const char *query, const char *key, bool *present, uint32_t *value)
+{
+    if (present) {
+        *present = false;
+    }
+    if (!query) {
+        return ESP_OK;
+    }
+
+    char raw[24];
+    if (httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK) {
+        return ESP_OK;
+    }
+
+    if (!parse_u32_string(raw, value)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (present) {
+        *present = true;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t query_get_optional_limit(const char *query,
+                                          const char *key,
+                                          size_t default_value,
+                                          size_t max_value,
+                                          size_t *out_value)
+{
+    if (!out_value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_value = default_value;
+    if (!query) {
+        return ESP_OK;
+    }
+
+    char raw[24];
+    if (httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK) {
+        return ESP_OK;
+    }
+
+    size_t parsed = 0;
+    if (!parse_size_string(raw, &parsed) || parsed == 0 || parsed > max_value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_value = parsed;
+    return ESP_OK;
+}
+
+static esp_err_t api_status_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    sensor_log_entry_t latest = {0};
+    bool from_sd = false;
+    bool has_latest = storage_load_latest_entry(s_storage, &latest, true, &from_sd);
+
+    time_t now = 0;
+    time(&now);
+
+    esp_err_t err = httpd_resp_sendstr_chunk(req, "{");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char head[256];
+    snprintf(head,
+             sizeof(head),
+             "\"device_time_unix\":%lu,\"sample_interval_sec\":%u,\"storage_source\":\"%s\","
+             "\"sd_ready\":%s,\"nvs_ready\":%s,\"latest_record\":",
+             (unsigned long)(now > 0 ? now : 0),
+             SENSOR_READ_INTERVAL_MS / 1000U,
+             has_latest ? storage_source_name(from_sd) : storage_source_name(s_storage->sd_ready),
+             s_storage->sd_ready ? "true" : "false",
+             s_storage->nvs_ready ? "true" : "false");
+    err = httpd_resp_sendstr_chunk(req, head);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (has_latest) {
+        err = send_json_entry_chunk(req, &latest, 1);
+    } else {
+        err = httpd_resp_sendstr_chunk(req, "null");
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = httpd_resp_sendstr_chunk(req, "}");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t api_records_get_handler(httpd_req_t *req)
+{
+    char *query = alloc_query_string(req);
+    if (httpd_req_get_url_query_len(req) > 0 && !query) {
+        return send_json_error(req, "500 Internal Server Error", "Query parsing failed");
+    }
+
+    bool has_from = false;
+    bool has_to = false;
+    uint32_t from_unix_time = 0;
+    uint32_t to_unix_time = 0;
+    size_t limit = API_DEFAULT_RECORD_LIMIT;
+
+    esp_err_t err = query_get_optional_u32(query, "from", &has_from, &from_unix_time);
+    if (err == ESP_OK) {
+        err = query_get_optional_u32(query, "to", &has_to, &to_unix_time);
+    }
+    if (err == ESP_OK) {
+        err = query_get_optional_limit(query, "limit", API_DEFAULT_RECORD_LIMIT, API_MAX_RECORDS_PER_RESPONSE, &limit);
+    }
+    if (err != ESP_OK) {
+        free(query);
+        return send_json_error(req, "400 Bad Request", "Invalid query parameters");
+    }
+    free(query);
+
+    if (has_from && has_to && from_unix_time > to_unix_time) {
+        return send_json_error(req, "400 Bad Request", "The from parameter must be <= to");
+    }
+
+    sensor_log_entry_t *entries = calloc(limit, sizeof(sensor_log_entry_t));
+    if (!entries) {
+        return send_json_error(req, "500 Internal Server Error", "Out of memory");
+    }
+
+    bool from_sd = false;
+    bool has_more = false;
+    bool newest_only = !has_from && !has_to;
+    size_t count = storage_load_filtered_entries(s_storage,
+                                                 entries,
+                                                 limit,
+                                                 newest_only,
+                                                 true,
+                                                 has_from,
+                                                 from_unix_time,
+                                                 has_to,
+                                                 to_unix_time,
+                                                 &from_sd,
+                                                 &has_more);
+
+    httpd_resp_set_type(req, "application/json");
+
+#define SEND_API_JSON_OR_EXIT(chunk_literal_or_buf)                 \
+    do {                                                            \
+        err = httpd_resp_sendstr_chunk(req, (chunk_literal_or_buf));\
+        if (err != ESP_OK) {                                        \
+            goto records_exit;                                      \
+        }                                                           \
+    } while (0)
+
+    char head[256];
+    if (has_from && has_to) {
+        snprintf(head,
+                 sizeof(head),
+                 "{\"count\":%lu,\"limit\":%lu,\"has_more\":%s,\"source\":\"%s\","
+                 "\"from\":%lu,\"to\":%lu,\"entries\":[",
+                 (unsigned long)count,
+                 (unsigned long)limit,
+                 has_more ? "true" : "false",
+                 storage_source_name(from_sd),
+                 (unsigned long)from_unix_time,
+                 (unsigned long)to_unix_time);
+    } else if (has_from) {
+        snprintf(head,
+                 sizeof(head),
+                 "{\"count\":%lu,\"limit\":%lu,\"has_more\":%s,\"source\":\"%s\","
+                 "\"from\":%lu,\"to\":null,\"entries\":[",
+                 (unsigned long)count,
+                 (unsigned long)limit,
+                 has_more ? "true" : "false",
+                 storage_source_name(from_sd),
+                 (unsigned long)from_unix_time);
+    } else if (has_to) {
+        snprintf(head,
+                 sizeof(head),
+                 "{\"count\":%lu,\"limit\":%lu,\"has_more\":%s,\"source\":\"%s\","
+                 "\"from\":null,\"to\":%lu,\"entries\":[",
+                 (unsigned long)count,
+                 (unsigned long)limit,
+                 has_more ? "true" : "false",
+                 storage_source_name(from_sd),
+                 (unsigned long)to_unix_time);
+    } else {
+        snprintf(head,
+                 sizeof(head),
+                 "{\"count\":%lu,\"limit\":%lu,\"has_more\":%s,\"source\":\"%s\","
+                 "\"from\":null,\"to\":null,\"entries\":[",
+                 (unsigned long)count,
+                 (unsigned long)limit,
+                 has_more ? "true" : "false",
+                 storage_source_name(from_sd));
+    }
+    SEND_API_JSON_OR_EXIT(head);
+
+    for (size_t i = 0; i < count; i++) {
+        if (i != 0) {
+            SEND_API_JSON_OR_EXIT(",");
+        }
+        err = send_json_entry_chunk(req, &entries[i], i + 1);
+        if (err != ESP_OK) {
+            goto records_exit;
+        }
+    }
+
+    SEND_API_JSON_OR_EXIT("]}");
+
+records_exit:
+    free(entries);
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, NULL);
+    } else {
+        ESP_LOGW(TAG, "HTTP records send aborted: %s", esp_err_to_name(err));
+    }
+#undef SEND_API_JSON_OR_EXIT
+    return err;
+}
+
+static esp_err_t api_sync_get_handler(httpd_req_t *req)
+{
+    char *query = alloc_query_string(req);
+    if (httpd_req_get_url_query_len(req) > 0 && !query) {
+        return send_json_error(req, "500 Internal Server Error", "Query parsing failed");
+    }
+
+    bool has_since = false;
+    uint32_t since_unix_time = 0;
+    size_t limit = API_DEFAULT_SYNC_LIMIT;
+
+    esp_err_t err = query_get_optional_u32(query, "since", &has_since, &since_unix_time);
+    if (err == ESP_OK) {
+        err = query_get_optional_limit(query, "limit", API_DEFAULT_SYNC_LIMIT, API_MAX_SYNC_BATCH_LIMIT, &limit);
+    }
+    if (err != ESP_OK) {
+        free(query);
+        return send_json_error(req, "400 Bad Request", "Invalid query parameters");
+    }
+    free(query);
+
+    sensor_log_entry_t *entries = calloc(API_SYNC_BUFFER_CAPACITY, sizeof(sensor_log_entry_t));
+    if (!entries) {
+        return send_json_error(req, "500 Internal Server Error", "Out of memory");
+    }
+
+    bool from_sd = false;
+    bool has_more = false;
+    uint32_t next_since = since_unix_time;
+    size_t count = storage_load_entries_after_time(s_storage,
+                                                   entries,
+                                                   API_SYNC_BUFFER_CAPACITY,
+                                                   limit,
+                                                   has_since ? since_unix_time : 0,
+                                                   true,
+                                                   &from_sd,
+                                                   &has_more,
+                                                   &next_since);
+
+    httpd_resp_set_type(req, "application/json");
+
+#define SEND_SYNC_JSON_OR_EXIT(chunk_literal_or_buf)                \
+    do {                                                            \
+        err = httpd_resp_sendstr_chunk(req, (chunk_literal_or_buf));\
+        if (err != ESP_OK) {                                        \
+            goto sync_exit;                                         \
+        }                                                           \
+    } while (0)
+
+    char head[220];
+    snprintf(head,
+             sizeof(head),
+             "{\"count\":%lu,\"limit\":%lu,\"has_more\":%s,\"next_since\":%lu,\"source\":\"%s\",\"entries\":[",
+             (unsigned long)count,
+             (unsigned long)limit,
+             has_more ? "true" : "false",
+             (unsigned long)next_since,
+             storage_source_name(from_sd));
+    SEND_SYNC_JSON_OR_EXIT(head);
+
+    for (size_t i = 0; i < count; i++) {
+        if (i != 0) {
+            SEND_SYNC_JSON_OR_EXIT(",");
+        }
+        err = send_json_entry_chunk(req, &entries[i], i + 1);
+        if (err != ESP_OK) {
+            goto sync_exit;
+        }
+    }
+
+    SEND_SYNC_JSON_OR_EXIT("]}");
+
+sync_exit:
+    free(entries);
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, NULL);
+    } else {
+        ESP_LOGW(TAG, "HTTP sync send aborted: %s", esp_err_to_name(err));
+    }
+#undef SEND_SYNC_JSON_OR_EXIT
+    return err;
 }
 
 static esp_err_t logs_page_get_handler(httpd_req_t *req)
@@ -428,7 +825,7 @@ esp_err_t web_server_start(const storage_ctx_t *storage)
     s_storage = storage;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 4;
+    config.max_uri_handlers = 7;
     config.stack_size = 8192;
 
     esp_err_t err = httpd_start(&s_http_server, &config);
@@ -457,6 +854,27 @@ esp_err_t web_server_start(const storage_ctx_t *storage)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t api_status_uri = {
+        .uri = "/api/v1/status",
+        .method = HTTP_GET,
+        .handler = api_status_get_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t api_records_uri = {
+        .uri = "/api/v1/records",
+        .method = HTTP_GET,
+        .handler = api_records_get_handler,
+        .user_ctx = NULL,
+    };
+
+    httpd_uri_t api_sync_uri = {
+        .uri = "/api/v1/sync",
+        .method = HTTP_GET,
+        .handler = api_sync_get_handler,
+        .user_ctx = NULL,
+    };
+
     err = httpd_register_uri_handler(s_http_server, &logs_uri);
     if (err != ESP_OK) {
         httpd_stop(s_http_server);
@@ -472,6 +890,27 @@ esp_err_t web_server_start(const storage_ctx_t *storage)
     }
 
     err = httpd_register_uri_handler(s_http_server, &logs_csv_uri);
+    if (err != ESP_OK) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+        return err;
+    }
+
+    err = httpd_register_uri_handler(s_http_server, &api_status_uri);
+    if (err != ESP_OK) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+        return err;
+    }
+
+    err = httpd_register_uri_handler(s_http_server, &api_records_uri);
+    if (err != ESP_OK) {
+        httpd_stop(s_http_server);
+        s_http_server = NULL;
+        return err;
+    }
+
+    err = httpd_register_uri_handler(s_http_server, &api_sync_uri);
     if (err != ESP_OK) {
         httpd_stop(s_http_server);
         s_http_server = NULL;

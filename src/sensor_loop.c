@@ -32,42 +32,52 @@ static void loop_task(void *pvParameter)
             log_entry.unix_time = (uint32_t)now;
         }
 
-        float t_c = 0.0f;
-        float rh = 0.0f;
-        esp_err_t err = ahtxx_get_measurement(s->aht, &t_c, &rh);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "AHT: T=%.2f C  RH=%.2f %%", t_c, rh);
-            log_entry.has_aht = 1;
-            log_entry.temperature_c_x100 = (int16_t)(t_c * 100.0f);
-            log_entry.humidity_pct_x100 = (int16_t)(rh * 100.0f);
-        } else {
-            ESP_LOGW(TAG, "AHT read failed: %s", esp_err_to_name(err));
-        }
-
-        ens160_validity_flags_t flag = 0;
-        err = ens160_get_validity_status(s->ens, &flag);
-        if (err == ESP_OK) {
-            if (flag == ENS160_VALFLAG_NORMAL) {
-                ens160_air_quality_data_t aq;
-                err = ens160_get_measurement(s->ens, &aq);
-                if (err == ESP_OK) {
-                    ESP_LOGI(TAG, "ENS: AQI=%u  TVOC=%u ppb  eCO2=%u ppm",
-                             aq.uba_aqi, aq.tvoc, aq.eco2);
-                    log_entry.has_ens = 1;
-                    log_entry.ens_validity = (uint8_t)flag;
-                    log_entry.aqi = aq.uba_aqi;
-                    log_entry.tvoc_ppb = aq.tvoc;
-                    log_entry.eco2_ppm = aq.eco2;
-                } else {
-                    ESP_LOGW(TAG, "ENS read failed: %s", esp_err_to_name(err));
-                    log_entry.ens_validity = UINT8_MAX;
-                }
+        esp_err_t err = ESP_OK;
+        if (s->aht) {
+            float t_c = 0.0f;
+            float rh = 0.0f;
+            err = ahtxx_get_measurement(s->aht, &t_c, &rh);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "AHT: T=%.2f C  RH=%.2f %%", t_c, rh);
+                log_entry.has_aht = 1;
+                log_entry.temperature_c_x100 = (int16_t)(t_c * 100.0f);
+                log_entry.humidity_pct_x100 = (int16_t)(rh * 100.0f);
             } else {
-                ESP_LOGI(TAG, "ENS not ready yet (validity=%d)", (int)flag);
-                log_entry.ens_validity = (uint8_t)flag;
+                ESP_LOGW(TAG, "AHT read failed: %s", esp_err_to_name(err));
             }
         } else {
-            ESP_LOGW(TAG, "ENS validity read failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "AHT sensor unavailable, skipping temperature/humidity read");
+        }
+
+        if (s->ens) {
+            ens160_validity_flags_t flag = 0;
+            err = ens160_get_validity_status(s->ens, &flag);
+            if (err == ESP_OK) {
+                if (flag == ENS160_VALFLAG_NORMAL) {
+                    ens160_air_quality_data_t aq;
+                    err = ens160_get_measurement(s->ens, &aq);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "ENS: AQI=%u  TVOC=%u ppb  eCO2=%u ppm",
+                                 aq.uba_aqi, aq.tvoc, aq.eco2);
+                        log_entry.has_ens = 1;
+                        log_entry.ens_validity = (uint8_t)flag;
+                        log_entry.aqi = aq.uba_aqi;
+                        log_entry.tvoc_ppb = aq.tvoc;
+                        log_entry.eco2_ppm = aq.eco2;
+                    } else {
+                        ESP_LOGW(TAG, "ENS read failed: %s", esp_err_to_name(err));
+                        log_entry.ens_validity = UINT8_MAX;
+                    }
+                } else {
+                    ESP_LOGI(TAG, "ENS not ready yet (validity=%d)", (int)flag);
+                    log_entry.ens_validity = (uint8_t)flag;
+                }
+            } else {
+                ESP_LOGW(TAG, "ENS validity read failed: %s", esp_err_to_name(err));
+                log_entry.ens_validity = UINT8_MAX;
+            }
+        } else {
+            ESP_LOGW(TAG, "ENS sensor unavailable, skipping air-quality read");
             log_entry.ens_validity = UINT8_MAX;
         }
 

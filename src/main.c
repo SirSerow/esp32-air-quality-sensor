@@ -1,7 +1,7 @@
-#include <assert.h>
 #include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_check.h"
 #include "esp_err.h"
@@ -21,6 +21,56 @@ static const char *TAG = "MAIN";
 static const char *TAG_TIME = "TIME";
 static const char *TAG_WIFI = "WIFI";
 static const char *TAG_OLED = "OLED";
+
+static ahtxx_handle_t init_aht_with_retries(i2c_master_bus_handle_t bus)
+{
+    ahtxx_config_t cfg = I2C_AHT20_CONFIG_DEFAULT;
+
+    for (int attempt = 1; attempt <= SENSOR_INIT_RETRY_COUNT; attempt++) {
+        ahtxx_handle_t handle = NULL;
+        ahtxx_init(bus, &cfg, &handle);
+        if (handle) {
+            ESP_LOGI(TAG, "AHT initialized on attempt %d/%d", attempt, SENSOR_INIT_RETRY_COUNT);
+            return handle;
+        }
+
+        ESP_LOGW(TAG,
+                 "AHT init failed on attempt %d/%d, retrying in %d ms",
+                 attempt,
+                 SENSOR_INIT_RETRY_COUNT,
+                 SENSOR_INIT_RETRY_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INIT_RETRY_DELAY_MS));
+    }
+
+    ESP_LOGW(TAG, "AHT unavailable after %d attempts, continuing without temperature/humidity sensor",
+             SENSOR_INIT_RETRY_COUNT);
+    return NULL;
+}
+
+static ens160_handle_t init_ens_with_retries(i2c_master_bus_handle_t bus)
+{
+    ens160_config_t cfg = I2C_ENS160_CONFIG_DEFAULT;
+
+    for (int attempt = 1; attempt <= SENSOR_INIT_RETRY_COUNT; attempt++) {
+        ens160_handle_t handle = NULL;
+        ens160_init(bus, &cfg, &handle);
+        if (handle) {
+            ESP_LOGI(TAG, "ENS160 initialized on attempt %d/%d", attempt, SENSOR_INIT_RETRY_COUNT);
+            return handle;
+        }
+
+        ESP_LOGW(TAG,
+                 "ENS160 init failed on attempt %d/%d, retrying in %d ms",
+                 attempt,
+                 SENSOR_INIT_RETRY_COUNT,
+                 SENSOR_INIT_RETRY_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INIT_RETRY_DELAY_MS));
+    }
+
+    ESP_LOGW(TAG, "ENS160 unavailable after %d attempts, continuing without air-quality sensor",
+             SENSOR_INIT_RETRY_COUNT);
+    return NULL;
+}
 
 void app_main(void)
 {
@@ -60,15 +110,8 @@ void app_main(void)
     i2c_master_bus_handle_t bus = NULL;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
 
-    ahtxx_config_t aht_cfg = I2C_AHT20_CONFIG_DEFAULT;
-    ahtxx_handle_t aht = NULL;
-    ahtxx_init(bus, &aht_cfg, &aht);
-    assert(aht);
-
-    ens160_config_t ens_cfg = I2C_ENS160_CONFIG_DEFAULT;
-    ens160_handle_t ens = NULL;
-    ens160_init(bus, &ens_cfg, &ens);
-    assert(ens);
+    ahtxx_handle_t aht = init_aht_with_retries(bus);
+    ens160_handle_t ens = init_ens_with_retries(bus);
 
     err = oled_display_init(bus);
     if (err != ESP_OK) {

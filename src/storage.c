@@ -67,6 +67,44 @@ static bool parse_sensor_csv_line(const char *line, sensor_log_entry_t *out_entr
     return true;
 }
 
+static bool entry_matches_filters(const sensor_log_entry_t *entry,
+                                  bool require_valid_time,
+                                  bool has_from,
+                                  uint32_t from_unix_time,
+                                  bool has_to,
+                                  uint32_t to_unix_time)
+{
+    if (require_valid_time && entry->unix_time == 0) {
+        return false;
+    }
+    if (has_from && entry->unix_time < from_unix_time) {
+        return false;
+    }
+    if (has_to && entry->unix_time > to_unix_time) {
+        return false;
+    }
+    return true;
+}
+
+static void append_entry_with_tail_window(sensor_log_entry_t *entries,
+                                          size_t max_entries,
+                                          size_t *loaded,
+                                          const sensor_log_entry_t *entry)
+{
+    if (max_entries == 0) {
+        return;
+    }
+
+    if (*loaded < max_entries) {
+        entries[*loaded] = *entry;
+        (*loaded)++;
+        return;
+    }
+
+    memmove(entries, &entries[1], (max_entries - 1) * sizeof(*entries));
+    entries[max_entries - 1] = *entry;
+}
+
 static void sd_log_debug_levels(void)
 {
     ESP_LOGI(TAG_SD,
@@ -366,6 +404,322 @@ static bool nvs_read_entry_compat(nvs_handle_t nvs, const char *key, sensor_log_
     return false;
 }
 
+static size_t load_filtered_entries_from_sd(const storage_ctx_t *ctx,
+                                            sensor_log_entry_t *entries,
+                                            size_t max_entries,
+                                            bool newest_only,
+                                            bool require_valid_time,
+                                            bool has_from,
+                                            uint32_t from_unix_time,
+                                            bool has_to,
+                                            uint32_t to_unix_time,
+                                            bool *has_more)
+{
+    if (has_more) {
+        *has_more = false;
+    }
+    if (!ctx || !ctx->sd_ready || max_entries == 0) {
+        return 0;
+    }
+
+    FILE *f = fopen(LOG_PATH, "r");
+    if (!f) {
+        return 0;
+    }
+
+    size_t loaded = 0;
+    size_t matched = 0;
+    char line[192];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "unix_time,", 10) == 0) {
+            continue;
+        }
+
+        sensor_log_entry_t entry = {0};
+        if (!parse_sensor_csv_line(line, &entry)) {
+            continue;
+        }
+        if (!entry_matches_filters(&entry, require_valid_time, has_from, from_unix_time, has_to, to_unix_time)) {
+            continue;
+        }
+
+        matched++;
+        if (newest_only) {
+            append_entry_with_tail_window(entries, max_entries, &loaded, &entry);
+            continue;
+        }
+
+        if (loaded < max_entries) {
+            entries[loaded++] = entry;
+            continue;
+        }
+
+        if (has_more) {
+            *has_more = true;
+        }
+        break;
+    }
+
+    fclose(f);
+
+    if (newest_only && has_more && matched > max_entries) {
+        *has_more = true;
+    }
+
+    return loaded;
+}
+
+static size_t load_filtered_entries_from_nvs(const storage_ctx_t *ctx,
+                                             sensor_log_entry_t *entries,
+                                             size_t max_entries,
+                                             bool newest_only,
+                                             bool require_valid_time,
+                                             bool has_from,
+                                             uint32_t from_unix_time,
+                                             bool has_to,
+                                             uint32_t to_unix_time,
+                                             bool *has_more)
+{
+    (void)ctx;
+
+    if (has_more) {
+        *has_more = false;
+    }
+    if (max_entries == 0) {
+        return 0;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return 0;
+    }
+
+    uint32_t wr_idx = 0;
+    uint32_t count = 0;
+    err = nvs_get_u32_default(nvs, "wr_idx", 0, &wr_idx);
+    if (err == ESP_OK) {
+        err = nvs_get_u32_default(nvs, "count", 0, &count);
+    }
+    if (err != ESP_OK) {
+        nvs_close(nvs);
+        return 0;
+    }
+
+    if (count > NVS_SLOT_COUNT) {
+        count = NVS_SLOT_COUNT;
+    }
+
+    uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
+    size_t loaded = 0;
+    size_t matched = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = (start + i) % NVS_SLOT_COUNT;
+        char key[8];
+        snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
+
+        sensor_log_entry_t entry = {0};
+        if (!nvs_read_entry_compat(nvs, key, &entry)) {
+            continue;
+        }
+        if (!entry_matches_filters(&entry, require_valid_time, has_from, from_unix_time, has_to, to_unix_time)) {
+            continue;
+        }
+
+        matched++;
+        if (newest_only) {
+            append_entry_with_tail_window(entries, max_entries, &loaded, &entry);
+            continue;
+        }
+
+        if (loaded < max_entries) {
+            entries[loaded++] = entry;
+            continue;
+        }
+
+        if (has_more) {
+            *has_more = true;
+        }
+        break;
+    }
+
+    nvs_close(nvs);
+
+    if (newest_only && has_more && matched > max_entries) {
+        *has_more = true;
+    }
+
+    return loaded;
+}
+
+static size_t load_entries_after_time_from_sd(const storage_ctx_t *ctx,
+                                              sensor_log_entry_t *entries,
+                                              size_t entry_capacity,
+                                              size_t batch_limit,
+                                              uint32_t since_unix_time,
+                                              bool require_valid_time,
+                                              bool *has_more,
+                                              uint32_t *next_since)
+{
+    if (has_more) {
+        *has_more = false;
+    }
+    if (next_since) {
+        *next_since = since_unix_time;
+    }
+    if (!ctx || !ctx->sd_ready || entry_capacity == 0 || batch_limit == 0) {
+        return 0;
+    }
+
+    FILE *f = fopen(LOG_PATH, "r");
+    if (!f) {
+        return 0;
+    }
+
+    size_t loaded = 0;
+    uint32_t boundary_time = 0;
+    bool boundary_active = false;
+    char line[192];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "unix_time,", 10) == 0) {
+            continue;
+        }
+
+        sensor_log_entry_t entry = {0};
+        if (!parse_sensor_csv_line(line, &entry)) {
+            continue;
+        }
+        if ((require_valid_time && entry.unix_time == 0) || entry.unix_time <= since_unix_time) {
+            continue;
+        }
+
+        if (loaded < batch_limit) {
+            if (loaded < entry_capacity) {
+                entries[loaded] = entry;
+            }
+            loaded++;
+            boundary_time = entry.unix_time;
+            if (next_since) {
+                *next_since = entry.unix_time;
+            }
+            continue;
+        }
+
+        if (!boundary_active) {
+            boundary_active = true;
+        }
+        if (entry.unix_time != boundary_time) {
+            if (has_more) {
+                *has_more = true;
+            }
+            break;
+        }
+        if (loaded < entry_capacity) {
+            entries[loaded] = entry;
+        }
+        loaded++;
+        if (next_since) {
+            *next_since = entry.unix_time;
+        }
+    }
+
+    fclose(f);
+    return loaded < entry_capacity ? loaded : entry_capacity;
+}
+
+static size_t load_entries_after_time_from_nvs(const storage_ctx_t *ctx,
+                                               sensor_log_entry_t *entries,
+                                               size_t entry_capacity,
+                                               size_t batch_limit,
+                                               uint32_t since_unix_time,
+                                               bool require_valid_time,
+                                               bool *has_more,
+                                               uint32_t *next_since)
+{
+    (void)ctx;
+
+    if (has_more) {
+        *has_more = false;
+    }
+    if (next_since) {
+        *next_since = since_unix_time;
+    }
+    if (entry_capacity == 0 || batch_limit == 0) {
+        return 0;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return 0;
+    }
+
+    uint32_t wr_idx = 0;
+    uint32_t count = 0;
+    err = nvs_get_u32_default(nvs, "wr_idx", 0, &wr_idx);
+    if (err == ESP_OK) {
+        err = nvs_get_u32_default(nvs, "count", 0, &count);
+    }
+    if (err != ESP_OK) {
+        nvs_close(nvs);
+        return 0;
+    }
+
+    if (count > NVS_SLOT_COUNT) {
+        count = NVS_SLOT_COUNT;
+    }
+
+    uint32_t start = (wr_idx + NVS_SLOT_COUNT - count) % NVS_SLOT_COUNT;
+    size_t loaded = 0;
+    uint32_t boundary_time = 0;
+    bool boundary_active = false;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = (start + i) % NVS_SLOT_COUNT;
+        char key[8];
+        snprintf(key, sizeof(key), "r%03lu", (unsigned long)slot);
+
+        sensor_log_entry_t entry = {0};
+        if (!nvs_read_entry_compat(nvs, key, &entry)) {
+            continue;
+        }
+        if ((require_valid_time && entry.unix_time == 0) || entry.unix_time <= since_unix_time) {
+            continue;
+        }
+
+        if (loaded < batch_limit) {
+            if (loaded < entry_capacity) {
+                entries[loaded] = entry;
+            }
+            loaded++;
+            boundary_time = entry.unix_time;
+            if (next_since) {
+                *next_since = entry.unix_time;
+            }
+            continue;
+        }
+
+        if (!boundary_active) {
+            boundary_active = true;
+        }
+        if (entry.unix_time != boundary_time) {
+            if (has_more) {
+                *has_more = true;
+            }
+            break;
+        }
+        if (loaded < entry_capacity) {
+            entries[loaded] = entry;
+        }
+        loaded++;
+        if (next_since) {
+            *next_since = entry.unix_time;
+        }
+    }
+
+    nvs_close(nvs);
+    return loaded < entry_capacity ? loaded : entry_capacity;
+}
+
 size_t storage_load_recent_entries_from_nvs(const storage_ctx_t *ctx,
                                             sensor_log_entry_t *entries,
                                             size_t max_entries)
@@ -513,6 +867,115 @@ size_t storage_load_recent_entries(const storage_ctx_t *ctx,
     }
 
     return storage_load_recent_entries_from_nvs(ctx, entries, max_entries);
+}
+
+size_t storage_load_filtered_entries(const storage_ctx_t *ctx,
+                                     sensor_log_entry_t *entries,
+                                     size_t max_entries,
+                                     bool newest_only,
+                                     bool require_valid_time,
+                                     bool has_from,
+                                     uint32_t from_unix_time,
+                                     bool has_to,
+                                     uint32_t to_unix_time,
+                                     bool *from_sd,
+                                     bool *has_more)
+{
+    if (from_sd) {
+        *from_sd = false;
+    }
+
+    if (ctx && ctx->sd_ready) {
+        size_t count = load_filtered_entries_from_sd(ctx,
+                                                     entries,
+                                                     max_entries,
+                                                     newest_only,
+                                                     require_valid_time,
+                                                     has_from,
+                                                     from_unix_time,
+                                                     has_to,
+                                                     to_unix_time,
+                                                     has_more);
+        if (from_sd) {
+            *from_sd = true;
+        }
+        return count;
+    }
+
+    return load_filtered_entries_from_nvs(ctx,
+                                          entries,
+                                          max_entries,
+                                          newest_only,
+                                          require_valid_time,
+                                          has_from,
+                                          from_unix_time,
+                                          has_to,
+                                          to_unix_time,
+                                          has_more);
+}
+
+size_t storage_load_entries_after_time(const storage_ctx_t *ctx,
+                                       sensor_log_entry_t *entries,
+                                       size_t entry_capacity,
+                                       size_t batch_limit,
+                                       uint32_t since_unix_time,
+                                       bool require_valid_time,
+                                       bool *from_sd,
+                                       bool *has_more,
+                                       uint32_t *next_since)
+{
+    if (from_sd) {
+        *from_sd = false;
+    }
+
+    if (ctx && ctx->sd_ready) {
+        size_t count = load_entries_after_time_from_sd(ctx,
+                                                       entries,
+                                                       entry_capacity,
+                                                       batch_limit,
+                                                       since_unix_time,
+                                                       require_valid_time,
+                                                       has_more,
+                                                       next_since);
+        if (from_sd) {
+            *from_sd = true;
+        }
+        return count;
+    }
+
+    return load_entries_after_time_from_nvs(ctx,
+                                            entries,
+                                            entry_capacity,
+                                            batch_limit,
+                                            since_unix_time,
+                                            require_valid_time,
+                                            has_more,
+                                            next_since);
+}
+
+bool storage_load_latest_entry(const storage_ctx_t *ctx,
+                               sensor_log_entry_t *entry,
+                               bool require_valid_time,
+                               bool *from_sd)
+{
+    if (!entry) {
+        return false;
+    }
+
+    bool has_more = false;
+    size_t count = storage_load_filtered_entries(ctx,
+                                                 entry,
+                                                 1,
+                                                 true,
+                                                 require_valid_time,
+                                                 false,
+                                                 0,
+                                                 false,
+                                                 0,
+                                                 from_sd,
+                                                 &has_more);
+    (void)has_more;
+    return count == 1;
 }
 
 bool storage_is_sd_ready(const storage_ctx_t *ctx)
