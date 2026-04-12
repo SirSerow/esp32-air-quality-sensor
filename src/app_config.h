@@ -1,0 +1,54 @@
+#ifndef APP_CONFIG_H
+#define APP_CONFIG_H
+
+#include "driver/i2c_master.h"
+
+#define I2C_PORT I2C_NUM_0
+#define I2C_SDA_GPIO 6
+#define I2C_SCL_GPIO 7
+#define I2C_FREQ_HZ 100000
+
+#define OLED_I2C_ADDR 0x3C
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+#define OLED_PAGE_COUNT (OLED_HEIGHT / 8)
+#define OLED_BUTTON_GPIO 5
+
+#define NVS_NAMESPACE "sensorlog"
+#define NVS_SLOT_COUNT 180
+
+#define WIFI_AP_CHANNEL 1
+#define WIFI_AP_MAX_CONN 4
+#define NTP_SERVER "pool.ntp.org"
+#define STA_CONNECT_TIMEOUT_MS 20000
+#define NTP_SYNC_TIMEOUT_MS 20000
+
+#define SENSOR_READ_INTERVAL_MS 60000
+
+#define PIN_NUM_MISO 21
+#define PIN_NUM_MOSI 22
+#define PIN_NUM_CLK 19
+#define PIN_NUM_CS 20
+
+#define MOUNT_POINT "/sdcard"
+#define LOG_PATH MOUNT_POINT "/logs.csv"
+#define WEB_GRAPH_POINT_COUNT 540
+#define WEB_TABLE_ROW_COUNT 10
+
+#define TEMP_OK_MIN_X100 2000
+#define TEMP_OK_MAX_X100 2700
+#define TEMP_WARN_MIN_X100 1800
+#define TEMP_WARN_MAX_X100 3000
+
+#define RH_OK_MIN_X100 4000
+#define RH_OK_MAX_X100 6000
+#define RH_WARN_MIN_X100 3000
+#define RH_WARN_MAX_X100 7000
+
+#define ECO2_OK_MAX 800
+#define ECO2_WARN_MAX 1200
+
+#define TVOC_OK_MAX 220
+#define TVOC_WARN_MAX 660
+
+#endif
