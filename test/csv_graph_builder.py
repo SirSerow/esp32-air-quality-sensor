@@ -10,7 +10,7 @@ import argparse
 import csv
 import importlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -43,6 +43,7 @@ class SensorCsvGraphBuilder:
         """
         self.output_dir = output_dir
         self.readings: list[SensorReading] = []
+        self.filtered_out_of_year_count = 0
 
     @staticmethod
     def _load_pyplot() -> Any:
@@ -89,7 +90,33 @@ class SensorCsvGraphBuilder:
             msg = "No valid sensor rows were found in the CSV file."
             raise ValueError(msg)
 
-        self.readings = parsed
+        cleaned = self._filter_current_year_readings(parsed)
+        self.filtered_out_of_year_count = len(parsed) - len(cleaned)
+
+        if not cleaned:
+            msg = "No sensor rows remain after filtering to the current year."
+            raise ValueError(msg)
+
+        self.readings = cleaned
+
+    @staticmethod
+    def _filter_current_year_readings(
+        readings: list[SensorReading],
+    ) -> list[SensorReading]:
+        """Keep only readings that belong to the current local year.
+
+        Args:
+            readings: Parsed sensor rows.
+
+        Returns:
+            A new list containing rows whose ``unix_time`` is in the current year.
+        """
+        current_year = datetime.now().year
+        return [
+            reading
+            for reading in readings
+            if datetime.fromtimestamp(reading.unix_time).year == current_year
+        ]
 
     def download_csv_file(self, csv_url: str, destination: Path) -> Path:
         """Download a CSV file from an HTTP endpoint.
@@ -115,6 +142,36 @@ class SensorCsvGraphBuilder:
 
         destination.write_bytes(payload)
         return destination
+
+    def filter_readings_by_period(self, period: str) -> int:
+        """Filter `self.readings` to the requested recent period.
+
+        Args:
+            period: One of 'day', 'week', 'month', 'year', 'all'.
+
+        Returns:
+            The number of rows removed by the period filter.
+        """
+        if period == "all":
+            return 0
+
+        now = datetime.now()
+        if period == "day":
+            cutoff = now - timedelta(days=1)
+        elif period == "week":
+            cutoff = now - timedelta(days=7)
+        elif period == "month":
+            cutoff = now - timedelta(days=30)
+        elif period == "year":
+            cutoff = now - timedelta(days=365)
+        else:
+            raise ValueError(f"Unknown period: {period}")
+
+        before = len(self.readings)
+        self.readings = [
+            r for r in self.readings if datetime.fromtimestamp(r.unix_time) >= cutoff
+        ]
+        return before - len(self.readings)
 
     def build_graphs(self) -> list[Path]:
         """Build one graph image for each reading value.
@@ -305,6 +362,17 @@ def parse_args() -> argparse.Namespace:
         default=Path("test/graphs"),
         help="Directory where PNG graphs are saved (default: test/graphs)",
     )
+    parser.add_argument(
+        "--period",
+        type=str,
+        choices=["day", "week", "month", "year", "all"],
+        default=None,
+        help=(
+            "Optional graphing period to restrict plotted data to the last "
+            "day/week/month/year or 'all' for no period filtering. If not set, "
+            "no period filtering is applied."
+        ),
+    )
     args = parser.parse_args()
 
     if args.csv_file is None and not args.url:
@@ -326,6 +394,21 @@ def main() -> None:
         builder.upload_csv_file(downloaded_path)
     else:
         builder.upload_csv_file(args.csv_file)
+
+    if builder.filtered_out_of_year_count > 0:
+        print(
+            "Filtered out "
+            f"{builder.filtered_out_of_year_count} row(s) outside the current year."
+        )
+
+    # Apply optional period filtering (day/week/month/year/all)
+    if args.period:
+        filtered_by_period = builder.filter_readings_by_period(args.period)
+        if filtered_by_period > 0:
+            print(
+                "Filtered out "
+                f"{filtered_by_period} row(s) outside the selected period ({args.period})."
+            )
 
     generated = builder.build_graphs()
 
