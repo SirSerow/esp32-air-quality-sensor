@@ -16,3 +16,4 @@ src/secrets.h
 *sensor-pcb-backups
 *.lck
 *graphs/
+.codex

@@ -751,6 +751,7 @@ static esp_err_t sync_time_via_sta(void)
         ESP_LOGW(TAG, "STA connect timeout, skip NTP sync");
         esp_wifi_stop();
         esp_wifi_deinit();
+        esp_netif_destroy(sta_netif);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -776,6 +777,7 @@ static esp_err_t sync_time_via_sta(void)
     esp_wifi_disconnect();
     esp_wifi_stop();
     esp_wifi_deinit();
+    esp_netif_destroy(sta_netif);
     return ESP_OK;
 }
 
@@ -857,9 +859,6 @@ retry_write:
 
     char slot_key[8];
     snprintf(slot_key, sizeof(slot_key), "r%03lu", (unsigned long)(wr_idx % NVS_SLOT_COUNT));
-
-    // Erase old entry first to help NVS garbage collector reclaim space
-    nvs_erase_key(nvs, slot_key);  // Ignore error if key doesn't exist
 
     err = nvs_set_blob(nvs, slot_key, entry, sizeof(*entry));
     if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !retried_after_reclaim) {
@@ -1589,25 +1588,31 @@ static void loop_task(void *pvParameter)
 
         // ---- ENS160 (AQI / TVOC / eCO2) ----
         // ENS160 can be "warming up" at first; validity flag tells you when data is normal.
-        ens160_validity_flags_t flag;
+        ens160_validity_flags_t flag = 0;
         err = ens160_get_validity_status(s->ens, &flag);
-        if (err == ESP_OK && flag == ENS160_VALFLAG_NORMAL) {
-            ens160_air_quality_data_t aq;
-            err = ens160_get_measurement(s->ens, &aq);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "ENS: AQI=%u  TVOC=%u ppb  eCO2=%u ppm",
-                         aq.uba_aqi, aq.tvoc, aq.eco2);
-                log_entry.has_ens = 1;
-                log_entry.ens_validity = (uint8_t)flag;
-                log_entry.aqi = aq.uba_aqi;
-                log_entry.tvoc_ppb = aq.tvoc;
-                log_entry.eco2_ppm = aq.eco2;
+        if (err == ESP_OK) {
+            if (flag == ENS160_VALFLAG_NORMAL) {
+                ens160_air_quality_data_t aq;
+                err = ens160_get_measurement(s->ens, &aq);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "ENS: AQI=%u  TVOC=%u ppb  eCO2=%u ppm",
+                             aq.uba_aqi, aq.tvoc, aq.eco2);
+                    log_entry.has_ens = 1;
+                    log_entry.ens_validity = (uint8_t)flag;
+                    log_entry.aqi = aq.uba_aqi;
+                    log_entry.tvoc_ppb = aq.tvoc;
+                    log_entry.eco2_ppm = aq.eco2;
+                } else {
+                    ESP_LOGW(TAG, "ENS read failed: %s", esp_err_to_name(err));
+                    log_entry.ens_validity = UINT8_MAX;
+                }
             } else {
-                ESP_LOGW(TAG, "ENS read failed: %s", esp_err_to_name(err));
+                ESP_LOGI(TAG, "ENS not ready yet (validity=%d)", (int)flag);
+                log_entry.ens_validity = (uint8_t)flag;
             }
         } else {
-            ESP_LOGI(TAG, "ENS not ready yet (validity=%d)", (int)flag);
-            log_entry.ens_validity = (uint8_t)flag;
+            ESP_LOGW(TAG, "ENS validity read failed: %s", esp_err_to_name(err));
+            log_entry.ens_validity = UINT8_MAX;
         }
 
         if (s_sd_ready) {
