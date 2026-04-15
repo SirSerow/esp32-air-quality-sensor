@@ -8,6 +8,7 @@
 
 #include "app_config.h"
 
+#include "network.h"
 #include "storage.h"
 #include "web_server.h"
 
@@ -917,6 +918,6 @@ esp_err_t web_server_start(const storage_ctx_t *storage)
         return err;
     }
 
-    ESP_LOGI(TAG, "Web server started on http://192.168.4.1/");
+    ESP_LOGI(TAG, "Web server started on %s", network_get_access_url());
     return ESP_OK;
 }

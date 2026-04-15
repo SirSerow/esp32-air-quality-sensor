@@ -17,3 +17,5 @@ src/secrets.h
 *.lck
 *graphs/
 .codex
+managed_components/
+*.lock

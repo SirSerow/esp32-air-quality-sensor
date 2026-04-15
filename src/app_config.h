@@ -19,6 +19,8 @@
 
 #define WIFI_AP_CHANNEL 1
 #define WIFI_AP_MAX_CONN 4
+#define MDNS_HOSTNAME "co2-sensor"
+#define MDNS_INSTANCE_NAME "CO2 Sensor"
 #define NTP_SERVER "pool.ntp.org"
 #define STA_CONNECT_TIMEOUT_MS 20000
 #define NTP_SYNC_TIMEOUT_MS 20000

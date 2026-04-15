@@ -18,7 +18,6 @@
 #include "web_server.h"
 
 static const char *TAG = "MAIN";
-static const char *TAG_TIME = "TIME";
 static const char *TAG_WIFI = "WIFI";
 static const char *TAG_OLED = "OLED";
 
@@ -83,14 +82,9 @@ void app_main(void)
         ESP_LOGW(TAG, "Persistent storage init degraded: %s", esp_err_to_name(err));
     }
 
-    err = network_sync_time_via_sta();
+    err = network_start();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG_TIME, "Time sync before AP failed: %s", esp_err_to_name(err));
-    }
-
-    err = network_start_softap();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG_WIFI, "WiFi AP start failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG_WIFI, "Network start failed: %s", esp_err_to_name(err));
     } else {
         err = web_server_start(&storage);
         if (err != ESP_OK) {

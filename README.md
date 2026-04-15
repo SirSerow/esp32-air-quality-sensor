@@ -1,6 +1,6 @@
 # ESP32 Air Quality Sensor
 
-ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quality) data, storing historical samples (SD card preferred, NVS fallback), showing live values on an SSD1306 OLED, and serving a built-in web dashboard over Wi-Fi hotspot mode.
+ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quality) data, storing historical samples (SD card preferred, NVS fallback), showing live values on an SSD1306 OLED, and serving a built-in web dashboard over external Wi-Fi when available, with SoftAP fallback.
 
 ## Hardware
 - ESP32-C6-DevKitC-1
@@ -22,7 +22,7 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
   - 4-line live status view (time, T/RH, AQI/TVOC, eCO2/validity)
   - Health code markers per value (`G`/`Y`/`R`)
   - Button toggle on GPIO5 (press to turn OLED on/off)
-- Starts Wi-Fi SoftAP automatically on boot.
+- Tries external Wi-Fi first, then falls back to SoftAP only if STA is unavailable.
 - Starts built-in HTTP server automatically on boot.
 - Web dashboard at `/` with:
   - Live-updating table of stored values
@@ -30,17 +30,21 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 - JSON API at `/json` for the built-in dashboard recent window.
 - CSV download endpoint at `/csv`.
 - Versioned server sync API under `/api/v1` for status, time-bounded history, and incremental polling.
-- Optional NTP sync via STA credentials before AP startup.
+- Syncs time over the STA connection when external Wi-Fi is available.
+- Starts mDNS on STA so the dashboard can be reached via a stable `.local` name.
 
 ## Default Runtime Configuration
+- STA dashboard URL: `http://co2-sensor.local/` when `WIFI_STA_SSID` / `WIFI_STA_PASS` are configured and reachable
+- mDNS hostname: `co2-sensor`
+- mDNS instance name: `CO2 Sensor`
 - SoftAP SSID: `CO2-Sensor-AP`
 - SoftAP password: `co2sensor123`
-- AP URL: `http://192.168.4.1/`
-- JSON endpoint: `http://192.168.4.1/json`
-- CSV endpoint: `http://192.168.4.1/csv`
-- Server status endpoint: `http://192.168.4.1/api/v1/status`
-- Server records endpoint: `http://192.168.4.1/api/v1/records`
-- Server sync endpoint: `http://192.168.4.1/api/v1/sync`
+- SoftAP fallback URL: `http://192.168.4.1/`
+- JSON endpoint: `/json`
+- CSV endpoint: `/csv`
+- Server status endpoint: `/api/v1/status`
+- Server records endpoint: `/api/v1/records`
+- Server sync endpoint: `/api/v1/sync`
 - Sampling interval: 1 minute (`SENSOR_READ_INTERVAL_MS = 60000`)
 - NVS ring-buffer capacity: 180 points (`NVS_SLOT_COUNT = 180`)
 - SD log file path: `/sdcard/logs.csv`
@@ -60,19 +64,38 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 From the project root:
 
 ```bash
-platformio run -e esp32-c6-devkitc-1
-platformio run -e esp32-c6-devkitc-1 -t upload
-platformio device monitor -b 115200
+/home/netlister/.platformio/penv/bin/platformio run -e esp32-c6-devkitc-1
+/home/netlister/.platformio/penv/bin/platformio run -e esp32-c6-devkitc-1 -t upload
+/home/netlister/.platformio/penv/bin/platformio device monitor -b 115200
 ```
+
+Use the `~/.platformio/penv/bin/platformio` binary on this machine. `/usr/bin/platformio` resolves to an older incompatible core here.
+
+## Wi-Fi Setup
+1. Copy `src/secrets.h.example` to `src/secrets.h` if you have not created it yet.
+2. Set `WIFI_STA_SSID` and `WIFI_STA_PASS` to the external Wi-Fi network you want the ESP32 to join.
+3. Keep `WIFI_AP_SSID` and `WIFI_AP_PASS` set for fallback access when the external network is unavailable.
+4. Rebuild and flash after changing credentials.
 
 ## Accessing the Dashboard
 1. Power/flash the board and wait for boot logs.
-2. Connect your phone/laptop to Wi-Fi `CO2-Sensor-AP`.
-3. Open:
+2. If STA connects successfully, open:
+   - Dashboard: `http://co2-sensor.local/`
+   - JSON: `http://co2-sensor.local/json`
+   - CSV: `http://co2-sensor.local/csv`
+   - Server API status: `http://co2-sensor.local/api/v1/status`
+3. If `.local` resolution is unreliable on your client, use the STA IP address printed in the boot log instead.
+4. If STA is unavailable, connect your phone/laptop to Wi-Fi `CO2-Sensor-AP` and use:
    - Dashboard: `http://192.168.4.1/`
    - JSON: `http://192.168.4.1/json`
    - CSV: `http://192.168.4.1/csv`
    - Server API status: `http://192.168.4.1/api/v1/status`
+
+## Network Startup Behavior
+1. Boot initializes storage and sensors.
+2. Firmware attempts STA connection using `WIFI_STA_SSID` and `WIFI_STA_PASS`.
+3. On STA success, the device syncs time with `pool.ntp.org`, starts mDNS, and serves HTTP on the STA interface.
+4. On STA failure or when credentials are blank, the device starts the fallback SoftAP and serves HTTP at `192.168.4.1`.
 
 Dashboard preview:
 ![Final result web GUI](images/user_web_gui.jpg)
@@ -183,8 +206,10 @@ Assembled/produced board (back):
 ```text
 I (...) MAIN: NVS logging enabled (sensorlog)
 I (...) MAIN: NVS stats: used=... free=... total=... namespaces=...
-I (...) MAIN: WiFi AP started: SSID=CO2-Sensor-AP CH=1
-I (...) MAIN: Web server started on http://192.168.4.1/
+I (...) NET: Connecting to external WiFi SSID=...
+I (...) NET: STA connected: IP=192.168.1.50 GW=192.168.1.1
+I (...) MDNS: mDNS started: http://co2-sensor.local/
+I (...) WEB: Web server started on http://co2-sensor.local/
 I (...) MAIN: AHT: T=25.17 C  RH=47.53 %
 I (...) MAIN: ENS: AQI=3  TVOC=331 ppb  eCO2=812 ppm
 ```
