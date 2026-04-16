@@ -270,3 +270,56 @@ const char *network_get_access_url(void)
 {
     return s_access_url;
 }
+
+esp_err_t network_get_status(network_status_t *status)
+{
+    if (!status) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(status, 0, sizeof(*status));
+    status->mode = s_sta_active ? NETWORK_MODE_STA : NETWORK_MODE_SOFTAP;
+    status->rssi = 0;
+    status->channel = WIFI_AP_CHANNEL;
+    strncpy(status->ssid, s_sta_active ? WIFI_STA_SSID : WIFI_AP_SSID, sizeof(status->ssid) - 1);
+
+    esp_netif_t *netif = s_sta_active ? s_sta_netif : s_ap_netif;
+    if (netif) {
+        esp_netif_ip_info_t ip_info = {0};
+        esp_err_t err = esp_netif_get_ip_info(netif, &ip_info);
+        if (err == ESP_OK) {
+            snprintf(status->ip, sizeof(status->ip), IPSTR, IP2STR(&ip_info.ip));
+            snprintf(status->gateway, sizeof(status->gateway), IPSTR, IP2STR(&ip_info.gw));
+            snprintf(status->netmask, sizeof(status->netmask), IPSTR, IP2STR(&ip_info.netmask));
+        }
+    }
+
+    if (s_sta_active) {
+        wifi_ap_record_t ap_info = {0};
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            status->rssi = ap_info.rssi;
+            status->channel = ap_info.primary;
+            status->has_rssi = true;
+            if (ap_info.ssid[0] != '\0') {
+                strncpy(status->ssid, (const char *)ap_info.ssid, sizeof(status->ssid) - 1);
+            }
+        }
+    } else {
+        wifi_sta_list_t sta_list = {0};
+        if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+            status->connected_clients = sta_list.num;
+        }
+    }
+
+    if (status->ip[0] == '\0') {
+        snprintf(status->ip, sizeof(status->ip), "0.0.0.0");
+    }
+    if (status->gateway[0] == '\0') {
+        snprintf(status->gateway, sizeof(status->gateway), "0.0.0.0");
+    }
+    if (status->netmask[0] == '\0') {
+        snprintf(status->netmask, sizeof(status->netmask), "0.0.0.0");
+    }
+
+    return ESP_OK;
+}

@@ -11,15 +11,23 @@
 
 #include "app_config.h"
 
+#include "network.h"
 #include "oled_display.h"
 
 static const char *TAG = "OLED";
 
+typedef enum {
+    OLED_VIEW_AIR_QUALITY = 0,
+    OLED_VIEW_NETWORK,
+    OLED_VIEW_OFF,
+} oled_view_t;
+
 static i2c_master_dev_handle_t s_oled_dev = NULL;
 static bool s_oled_available = false;
-static bool s_oled_enabled = true;
-static volatile bool s_oled_toggle_requested = false;
+static oled_view_t s_oled_view = OLED_VIEW_AIR_QUALITY;
+static volatile uint32_t s_button_press_count = 0;
 static volatile TickType_t s_button_last_tick = 0;
+static portMUX_TYPE s_button_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_latest_entry_mutex = NULL;
 static sensor_log_entry_t s_latest_entry = {0};
 static bool s_latest_entry_valid = false;
@@ -100,17 +108,31 @@ static void oled_font5x7(char c, uint8_t out[5])
 
     switch (c) {
     case 'A': memcpy(out, (uint8_t[5]){0x7E, 0x11, 0x11, 0x11, 0x7E}, 5); break;
+    case 'B': memcpy(out, (uint8_t[5]){0x7F, 0x49, 0x49, 0x49, 0x36}, 5); break;
     case 'C': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x22}, 5); break;
+    case 'D': memcpy(out, (uint8_t[5]){0x7F, 0x41, 0x41, 0x22, 0x1C}, 5); break;
     case 'E': memcpy(out, (uint8_t[5]){0x7F, 0x49, 0x49, 0x49, 0x41}, 5); break;
+    case 'F': memcpy(out, (uint8_t[5]){0x7F, 0x09, 0x09, 0x09, 0x01}, 5); break;
     case 'G': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x49, 0x49, 0x7A}, 5); break;
     case 'H': memcpy(out, (uint8_t[5]){0x7F, 0x08, 0x08, 0x08, 0x7F}, 5); break;
     case 'I': memcpy(out, (uint8_t[5]){0x00, 0x41, 0x7F, 0x41, 0x00}, 5); break;
+    case 'J': memcpy(out, (uint8_t[5]){0x20, 0x40, 0x41, 0x3F, 0x01}, 5); break;
+    case 'K': memcpy(out, (uint8_t[5]){0x7F, 0x08, 0x14, 0x22, 0x41}, 5); break;
+    case 'L': memcpy(out, (uint8_t[5]){0x7F, 0x40, 0x40, 0x40, 0x40}, 5); break;
+    case 'M': memcpy(out, (uint8_t[5]){0x7F, 0x02, 0x0C, 0x02, 0x7F}, 5); break;
+    case 'N': memcpy(out, (uint8_t[5]){0x7F, 0x04, 0x08, 0x10, 0x7F}, 5); break;
     case 'O': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x41, 0x41, 0x3E}, 5); break;
+    case 'P': memcpy(out, (uint8_t[5]){0x7F, 0x09, 0x09, 0x09, 0x06}, 5); break;
     case 'Q': memcpy(out, (uint8_t[5]){0x3E, 0x41, 0x51, 0x21, 0x5E}, 5); break;
     case 'R': memcpy(out, (uint8_t[5]){0x7F, 0x09, 0x19, 0x29, 0x46}, 5); break;
+    case 'S': memcpy(out, (uint8_t[5]){0x46, 0x49, 0x49, 0x49, 0x31}, 5); break;
     case 'T': memcpy(out, (uint8_t[5]){0x01, 0x01, 0x7F, 0x01, 0x01}, 5); break;
+    case 'U': memcpy(out, (uint8_t[5]){0x3F, 0x40, 0x40, 0x40, 0x3F}, 5); break;
     case 'V': memcpy(out, (uint8_t[5]){0x1F, 0x20, 0x40, 0x20, 0x1F}, 5); break;
+    case 'W': memcpy(out, (uint8_t[5]){0x3F, 0x40, 0x38, 0x40, 0x3F}, 5); break;
+    case 'X': memcpy(out, (uint8_t[5]){0x63, 0x14, 0x08, 0x14, 0x63}, 5); break;
     case 'Y': memcpy(out, (uint8_t[5]){0x03, 0x04, 0x78, 0x04, 0x03}, 5); break;
+    case 'Z': memcpy(out, (uint8_t[5]){0x61, 0x51, 0x49, 0x45, 0x43}, 5); break;
     case ':': memcpy(out, (uint8_t[5]){0x00, 0x36, 0x36, 0x00, 0x00}, 5); break;
     case '.': memcpy(out, (uint8_t[5]){0x00, 0x40, 0x60, 0x00, 0x00}, 5); break;
     case '%': memcpy(out, (uint8_t[5]){0x63, 0x13, 0x08, 0x64, 0x63}, 5); break;
@@ -294,13 +316,53 @@ static esp_err_t oled_render_entry(const sensor_log_entry_t *entry)
     return oled_flush(framebuffer);
 }
 
+static esp_err_t oled_render_network(void)
+{
+    uint8_t framebuffer[OLED_WIDTH * OLED_PAGE_COUNT];
+    memset(framebuffer, 0, sizeof(framebuffer));
+
+    network_status_t status = {0};
+    esp_err_t err = network_get_status(&status);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char line1[22];
+    char line2[22];
+    char line3[22];
+    char line4[22];
+
+    snprintf(line1, sizeof(line1), "NET MODE:%s",
+             status.mode == NETWORK_MODE_STA ? "STA" : "AP");
+    snprintf(line2, sizeof(line2), "IP:%s", status.ip);
+    snprintf(line3, sizeof(line3), "GW:%s", status.gateway);
+    if (status.mode == NETWORK_MODE_STA) {
+        if (status.has_rssi) {
+            snprintf(line4, sizeof(line4), "RSSI:%d CH:%u", status.rssi, status.channel);
+        } else {
+            snprintf(line4, sizeof(line4), "RSSI:- CH:%u", status.channel);
+        }
+    } else {
+        snprintf(line4, sizeof(line4), "CLIENTS:%u CH:%u", status.connected_clients, status.channel);
+    }
+
+    oled_draw_text(framebuffer, 0, 0, line1);
+    oled_draw_text(framebuffer, 0, 16, line2);
+    oled_draw_text(framebuffer, 0, 32, line3);
+    oled_draw_text(framebuffer, 0, 48, line4);
+
+    return oled_flush(framebuffer);
+}
+
 static void IRAM_ATTR oled_button_isr_handler(void *arg)
 {
     (void)arg;
     TickType_t now = xTaskGetTickCountFromISR();
     if ((now - s_button_last_tick) >= pdMS_TO_TICKS(200)) {
         s_button_last_tick = now;
-        s_oled_toggle_requested = true;
+        portENTER_CRITICAL_ISR(&s_button_lock);
+        s_button_press_count++;
+        portEXIT_CRITICAL_ISR(&s_button_lock);
     }
 }
 
@@ -332,18 +394,43 @@ static void display_task(void *pvParameter)
     (void)pvParameter;
 
     while (1) {
-        if (s_oled_toggle_requested) {
-            s_oled_toggle_requested = false;
-            s_oled_enabled = !s_oled_enabled;
-            esp_err_t pwr_err = oled_set_power(s_oled_enabled);
-            if (pwr_err != ESP_OK) {
-                ESP_LOGW(TAG, "OLED power toggle failed: %s", esp_err_to_name(pwr_err));
-            } else {
-                ESP_LOGI(TAG, "OLED %s", s_oled_enabled ? "ON" : "OFF");
+        uint32_t button_presses = 0;
+        portENTER_CRITICAL(&s_button_lock);
+        button_presses = s_button_press_count;
+        s_button_press_count = 0;
+        portEXIT_CRITICAL(&s_button_lock);
+
+        for (uint32_t i = 0; i < button_presses; i++) {
+            oled_view_t previous_view = s_oled_view;
+            s_oled_view = (oled_view_t)((s_oled_view + 1) % 3);
+
+            if (previous_view == OLED_VIEW_OFF || s_oled_view == OLED_VIEW_OFF) {
+                esp_err_t pwr_err = oled_set_power(s_oled_view != OLED_VIEW_OFF);
+                if (pwr_err != ESP_OK) {
+                    ESP_LOGW(TAG, "OLED power change failed: %s", esp_err_to_name(pwr_err));
+                }
             }
+
+            if (s_oled_view == OLED_VIEW_OFF) {
+                oled_clear();
+            }
+
+            ESP_LOGI(TAG, "OLED view changed to %s",
+                     s_oled_view == OLED_VIEW_AIR_QUALITY ? "air quality" :
+                     s_oled_view == OLED_VIEW_NETWORK ? "network" : "off");
         }
 
-        if (s_oled_enabled && s_oled_available) {
+        if (s_oled_available && s_oled_view == OLED_VIEW_NETWORK) {
+            esp_err_t draw_err = oled_render_network();
+            if (draw_err != ESP_OK) {
+                ESP_LOGW(TAG, "OLED network render failed: %s", esp_err_to_name(draw_err));
+            }
+        } else if (s_oled_available && s_oled_view == OLED_VIEW_AIR_QUALITY) {
+            esp_err_t pwr_err = oled_set_power(true);
+            if (pwr_err != ESP_OK) {
+                ESP_LOGW(TAG, "OLED power on failed: %s", esp_err_to_name(pwr_err));
+            }
+
             sensor_log_entry_t snapshot = {0};
             bool has_data = false;
             if (s_latest_entry_mutex && xSemaphoreTake(s_latest_entry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -412,7 +499,7 @@ esp_err_t oled_display_init(i2c_master_bus_handle_t bus)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Button init failed on GPIO %d: %s", OLED_BUTTON_GPIO, esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "Button configured on GPIO %d (active-low, press to toggle OLED)", OLED_BUTTON_GPIO);
+        ESP_LOGI(TAG, "Button configured on GPIO %d (active-low, press to cycle OLED views)", OLED_BUTTON_GPIO);
     }
 
     xTaskCreate(display_task, "display_task", 4096, NULL, 4, NULL);
