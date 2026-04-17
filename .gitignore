@@ -11,6 +11,9 @@ src/secrets.h
 *kicad_sch.lck*
 *fp-info-cache*
 .venv/
+.env
+.env.*
+!.env.example
 *.csv
 *sensor-pcb/output/
 *sensor-pcb-backups
@@ -19,3 +22,6 @@ src/secrets.h
 .codex
 managed_components/
 *.lock
+CLAUDE*
+*.csv
+*.log

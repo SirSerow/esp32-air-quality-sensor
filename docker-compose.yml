@@ -1,0 +1,18 @@
+services:
+  co2-analysis-server:
+    build:
+      context: ./server
+    container_name: co2-analysis-server
+    restart: unless-stopped
+    environment:
+      SENSOR_BASE_URL: ${SENSOR_BASE_URL:-http://co2-sensor.local}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-60}
+      REQUEST_TIMEOUT_SEC: ${REQUEST_TIMEOUT_SEC:-30}
+      DATA_DIR: /data
+    ports:
+      - "${SERVER_PORT:-8000}:8000"
+    volumes:
+      - co2_sensor_data:/data
+
+volumes:
+  co2_sensor_data:

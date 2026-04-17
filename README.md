@@ -2,6 +2,25 @@
 
 ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quality) data, storing historical samples (SD card preferred, NVS fallback), showing live values on an SSD1306 OLED, and serving a built-in web dashboard over external Wi-Fi when available, with SoftAP fallback.
 
+## Sensor Readings
+
+The device measures six quantities using two sensors on the I²C bus:
+
+| Metric | Sensor | Unit | Good | Moderate | Poor |
+|---|---|---|---|---|---|
+| Temperature | AHT20 | °C | ≤ 26 | 26 – 30 | > 30 |
+| Relative Humidity | AHT20 | % | 30 – 60 | 60 – 70 | > 70 or < 20 |
+| eCO₂ | ENS160 | ppm | < 800 | 800 – 2 000 | > 2 000 |
+| AQI | ENS160 | 1–5 | 1 – 2 | 3 | 4 – 5 |
+| TVOC | ENS160 | ppb | < 220 | 220 – 660 | > 660 |
+| ENS Validity | ENS160 | 0–3 | 0 (normal) | 1–2 (warm-up) | 3 (error) |
+
+**AHT20** measures capacitive relative humidity and temperature. Readings are available within seconds of power-on and are unaffected by air quality.
+
+**ENS160** is a metal-oxide gas sensor that estimates eCO₂ and TVOC algorithmically. It requires a warm-up period of ~30 s (validity = 1) and a start-up conditioning phase of ~3 min (validity = 2) before readings are reliable (validity = 0). The eCO₂ value is *not* a direct CO₂ measurement — it is derived from the TVOC signal and correlates with air freshness and human presence. Outdoor air is approximately 400 ppm eCO₂.
+
+![Sensor reading reference](images/sensor-reading-explanation.png)
+
 ## Hardware
 - ESP32-C6-DevKitC-1
 - Sensor board with:
@@ -30,6 +49,10 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 - JSON API at `/json` for the built-in dashboard recent window.
 - CSV download endpoint at `/csv`.
 - Versioned server sync API under `/api/v1` for status, time-bounded history, and incremental polling.
+- Optional Docker Compose analysis server for Raspberry Pi or another machine:
+  - Polls the ESP32 sync API and imports all history on first connection.
+  - Stores readings in SQLite.
+  - Full-featured web dashboard (see [Web Analysis Dashboard](#web-analysis-dashboard)) with range filters, aggregation views, interactive charts, summary statistics, CSV export, dark mode, and a collapsible sensor reference guide.
 - Syncs time over the STA connection when external Wi-Fi is available.
 - Starts mDNS on STA so the dashboard can be reached via a stable `.local` name.
 
@@ -56,6 +79,7 @@ ESP32-C6 firmware for reading AHT20 (temperature/humidity) and ENS160 (air quali
 - `include/` project headers
 - `lib/` external/project libraries
 - `test/` test files
+- `server/` Dockerized data collector and analysis dashboard
 - `platformio.ini` PlatformIO configuration
 - `CMakeLists.txt` CMake/ESP-IDF project file
 - `sdkconfig.esp32-c6-devkitc-1` board-specific ESP-IDF config
@@ -96,9 +120,6 @@ Use the `~/.platformio/penv/bin/platformio` binary on this machine. `/usr/bin/pl
 2. Firmware attempts STA connection using `WIFI_STA_SSID` and `WIFI_STA_PASS`.
 3. On STA success, the device syncs time with `pool.ntp.org`, starts mDNS, and serves HTTP on the STA interface.
 4. On STA failure or when credentials are blank, the device starts the fallback SoftAP and serves HTTP at `192.168.4.1`.
-
-Dashboard preview:
-![Final result web GUI](images/user_web_gui.jpg)
 
 ## OLED Display Layout
 - Line 1: local time (`YY-MM-DD HH:MM`) when time is synced
@@ -172,6 +193,77 @@ Polling model:
 2. Store the returned `next_since` value after successfully ingesting the batch.
 3. If `has_more` is `true`, call `/api/v1/sync?since=<next_since>` again immediately.
 4. Otherwise wait until the next polling interval.
+
+## Docker Analysis Server
+Run the companion server on a Raspberry Pi or separate machine on the same network:
+
+```bash
+SENSOR_BASE_URL=http://192.168.1.50 docker compose up --build -d
+```
+
+Open `http://localhost:8000/` on that machine. Replace `192.168.1.50` with the ESP32 STA IP address from the serial boot log. Set `SERVER_PORT=8080` if port 8000 is already in use.
+
+The server persists data in a Docker volume named `co2_sensor_data`. On first successful connection it calls the ESP32 `/api/v1/sync?since=0` endpoint until all available history has been imported, then continues incremental polling using the returned cursor. See `server/README.md` for API details and operational notes.
+
+## Web Analysis Dashboard
+
+The companion analysis server (`server/`) runs as a Docker container and provides a full-featured dashboard accessible from any browser on the local network.
+
+### Starting the server
+
+```bash
+cp .env.example .env          # set SENSOR_BASE_URL to the ESP32 IP or co2-sensor.local
+docker compose up -d --build
+```
+
+Open `http://<server-ip>:8000/` in any browser.
+
+### Features
+
+**Data range and aggregation**
+Select a preset time range (last 24 h / 7 days / 30 days / year / all) or enter a custom start/end date. Choose between raw samples, minute averages, hourly averages, or daily averages.
+
+**Summary cards**
+Six cards — one per metric — show the average, minimum, and maximum value for the selected range. Each card has a coloured top bar matching the metric's chart colour.
+
+**Interactive charts**
+One chart per metric, laid out in a responsive grid:
+- Temperature and Humidity — side by side
+- eCO₂ — full-width, taller
+- AQI and TVOC — side by side
+- ENS Validity — full-width, compact
+
+Every chart features:
+- Area gradient fill under the line
+- Smart X-axis time labels that switch between `HH:mm`, `HH:mm` with date, or date-only depending on the selected range
+- Dashed threshold lines (yellow/red) marking health boundaries
+- Lightly shaded danger zones above each threshold
+- **Expand button** (`⤢`) in the chart header — click to make any chart full-width and taller; state is saved across page reloads
+
+Hovering over a chart shows a crosshair and a tooltip with the exact timestamp and value at that point.
+
+**Recent rows table**
+Collapsible table showing the 80 most recent readings. Air quality cells are colour-coded green / amber / red. Click the header row to collapse or expand.
+
+**Sensor reference guide**
+Collapsible section (collapsed by default) with one card per metric explaining what the sensor measures, a good / moderate / poor range table, and practical notes. Useful as a quick in-page reference without needing external documentation.
+
+**Sync controls**
+- **Sync** — triggers an immediate incremental poll of the ESP32
+- **Full import** — re-imports the entire ESP32 history from timestamp 0
+
+**Settings**
+Click the ⚙ button to change the ESP32 address at runtime without restarting the server. The new address takes effect immediately and the sync loop reconnects automatically.
+
+**Dark mode**
+Click the ◐ button to toggle between light and dark theme. The preference is saved in `localStorage`.
+
+**CSV export**
+Downloads all readings in the selected time range as a plain CSV file.
+
+### Screenshot
+
+![Analysis server web dashboard](images/analysis-server-gui.png)
 
 ## KiCad Schematic & PCB Design
 The hardware was designed in KiCad and includes:

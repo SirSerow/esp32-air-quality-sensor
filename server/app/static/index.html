@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CO2 Sensor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1>CO2 Sensor Analysis</h1>
+      <p id="sourceLabel">—</p>
+    </div>
+    <div class="topbar-right">
+      <div class="conn-badge">
+        <span id="connectionDot" class="dot"></span>
+        <span id="connectionText">—</span>
+      </div>
+      <button type="button" id="syncButton">Sync</button>
+      <button type="button" id="fullSyncButton" class="hide-xs">Full import</button>
+      <button type="button" class="icon-btn" id="settingsButton" title="Settings">⚙</button>
+      <button type="button" class="icon-btn" id="themeButton" title="Toggle dark mode">◐</button>
+    </div>
+  </header>
+
+  <div class="settings-panel" id="settingsPanel">
+    <label>
+      ESP address
+      <input type="text" id="espUrlInput" placeholder="http://co2-sensor.local" spellcheck="false">
+    </label>
+    <button type="button" class="primary" id="espUrlSave">Apply</button>
+    <span id="espUrlStatus"></span>
+  </div>
+
+  <main>
+    <section class="controls">
+      <label>
+        Range
+        <select id="rangeSelect">
+          <option value="day">Last 24 h</option>
+          <option value="week" selected>Last 7 days</option>
+          <option value="month">Last 30 days</option>
+          <option value="year">Last year</option>
+          <option value="all">All data</option>
+          <option value="custom">Custom</option>
+        </select>
+      </label>
+      <label class="hide-xs">
+        From
+        <input id="startInput" type="datetime-local">
+      </label>
+      <label class="hide-xs">
+        To
+        <input id="endInput" type="datetime-local">
+      </label>
+      <label>
+        View
+        <select id="viewSelect">
+          <option value="raw">Raw</option>
+          <option value="minute">Minute avg</option>
+          <option value="hour" selected>Hourly avg</option>
+          <option value="day">Daily avg</option>
+        </select>
+      </label>
+      <a id="csvLink" class="button-link" href="/api/export.csv">Export CSV</a>
+    </section>
+
+    <section class="overview">
+      <div class="metric"><span>Total readings</span><strong id="totalReadings">—</strong></div>
+      <div class="metric"><span>Latest sample</span><strong id="latestSample">—</strong></div>
+      <div class="metric"><span>Storage source</span><strong id="storageSource">—</strong></div>
+      <div class="metric"><span>Last sync</span><strong id="lastSync">—</strong></div>
+    </section>
+
+    <section class="summary" id="summaryGrid"></section>
+
+    <!-- Charts -->
+    <section class="charts">
+
+      <article data-chart-id="tempChart" data-default-span="1">
+        <div class="chart-header">
+          <h2>Temperature</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-temp)">°C</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="tempChart"></canvas>
+      </article>
+
+      <article data-chart-id="humidityChart" data-default-span="1">
+        <div class="chart-header">
+          <h2>Humidity</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-humidity)">%</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="humidityChart"></canvas>
+      </article>
+
+      <article data-chart-id="eco2Chart" data-default-span="2">
+        <div class="chart-header">
+          <h2>eCO₂</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-eco2)">ppm</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="eco2Chart" class="tall"></canvas>
+      </article>
+
+      <article data-chart-id="aqiChart" data-default-span="1">
+        <div class="chart-header">
+          <h2>AQI</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-aqi)">1–5</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="aqiChart"></canvas>
+      </article>
+
+      <article data-chart-id="tvocChart" data-default-span="1">
+        <div class="chart-header">
+          <h2>TVOC</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-tvoc)">ppb</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="tvocChart"></canvas>
+      </article>
+
+      <article data-chart-id="validityChart" data-default-span="2">
+        <div class="chart-header">
+          <h2>ENS Validity</h2>
+          <div class="chart-header-right">
+            <div class="chart-legend"><span style="--swatch-color:var(--c-validity)">0–3</span></div>
+            <button class="icon-btn expand-btn" title="Expand chart">⤢</button>
+          </div>
+        </div>
+        <canvas id="validityChart" class="short"></canvas>
+      </article>
+
+    </section>
+
+    <!-- Recent rows (collapsible) -->
+    <details class="table-section" id="tableDetails" open>
+      <summary class="section-head">
+        <div class="section-head-left">
+          <h2>Recent rows</h2>
+          <span id="tableNote"></span>
+        </div>
+        <span class="chevron">›</span>
+      </summary>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Temp °C</th>
+              <th>RH %</th>
+              <th>AQI</th>
+              <th>TVOC ppb</th>
+              <th>eCO2 ppm</th>
+              <th>Validity</th>
+            </tr>
+          </thead>
+          <tbody id="rowsBody"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <!-- Sensor reference (collapsible) -->
+    <details class="info-section" id="infoDetails">
+      <summary class="section-head">
+        <div class="section-head-left">
+          <h2>Sensor reference</h2>
+          <span>AHT20 · ENS160</span>
+        </div>
+        <span class="chevron">›</span>
+      </summary>
+      <div class="info-grid">
+
+        <div class="info-card" style="--card-color:var(--c-temp)">
+          <div class="info-card-top">
+            <strong>Temperature</strong>
+            <code>AHT20</code>
+          </div>
+          <p>Ambient air temperature measured by the AHT20 capacitive sensor on the I²C bus. Reflects how warm or cool the air is — high temperatures reduce comfort and increase CO₂ generation from people.</p>
+          <table class="range-table">
+            <thead><tr><th>Level</th><th>Range</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">Good</td><td>≤ 26 °C</td><td>Comfortable indoors</td></tr>
+              <tr><td class="quality-warn">Moderate</td><td>26 – 30 °C</td><td>Warm, may affect comfort</td></tr>
+              <tr><td class="quality-bad">High</td><td>&gt; 30 °C</td><td>Hot, ventilate or cool down</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Typical indoor comfort: 18 – 24 °C</div>
+        </div>
+
+        <div class="info-card" style="--card-color:var(--c-humidity)">
+          <div class="info-card-top">
+            <strong>Relative Humidity</strong>
+            <code>AHT20</code>
+          </div>
+          <p>Percentage of water vapour in the air relative to saturation. Too low causes dry air and static; too high promotes mould, dust mites, and condensation.</p>
+          <table class="range-table">
+            <thead><tr><th>Level</th><th>Range</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">Good</td><td>30 – 60 %</td><td>Comfortable, healthy</td></tr>
+              <tr><td class="quality-warn">Moderate</td><td>60 – 70 %</td><td>Humid, monitor for mould</td></tr>
+              <tr><td class="quality-bad">High</td><td>&gt; 70 % or &lt; 20 %</td><td>Too humid or too dry</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Ideal: 40 – 55 % for most people</div>
+        </div>
+
+        <div class="info-card" style="--card-color:var(--c-eco2)">
+          <div class="info-card-top">
+            <strong>eCO₂</strong>
+            <code>ENS160</code>
+          </div>
+          <p>Equivalent CO₂ concentration in ppm, algorithmically estimated from TVOC readings. Not a direct CO₂ measurement — it correlates with human activity and air freshness. High values mean stale air.</p>
+          <table class="range-table">
+            <thead><tr><th>Level</th><th>Range</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">Fresh</td><td>&lt; 800 ppm</td><td>Good air quality</td></tr>
+              <tr><td class="quality-warn">Moderate</td><td>800 – 2 000 ppm</td><td>Ventilate the room</td></tr>
+              <tr><td class="quality-bad">Poor</td><td>&gt; 2 000 ppm</td><td>Open windows immediately</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Outdoor baseline ≈ 400 ppm · Unsafe &gt; 5 000 ppm</div>
+        </div>
+
+        <div class="info-card" style="--card-color:var(--c-aqi)">
+          <div class="info-card-top">
+            <strong>Air Quality Index</strong>
+            <code>ENS160</code>
+          </div>
+          <p>Proprietary ENS160 index from 1 (excellent) to 5 (unhealthy). Combines TVOC, humidity-compensation, and gas-sensor data into a single score. Useful as a quick at-a-glance indicator.</p>
+          <table class="range-table">
+            <thead><tr><th>Score</th><th>Label</th><th>Action</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">1 – 2</td><td>Excellent / Good</td><td>No action needed</td></tr>
+              <tr><td class="quality-warn">3</td><td>Moderate</td><td>May affect sensitive people</td></tr>
+              <tr><td class="quality-bad">4 – 5</td><td>Poor / Unhealthy</td><td>Ventilate immediately</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Readings during warm-up (validity ≠ 0) may be unreliable</div>
+        </div>
+
+        <div class="info-card" style="--card-color:var(--c-tvoc)">
+          <div class="info-card-top">
+            <strong>TVOC</strong>
+            <code>ENS160</code>
+          </div>
+          <p>Total Volatile Organic Compounds in ppb. VOCs include gases from cleaning products, furniture, paints, cooking, and human breath. Chronic exposure to elevated TVOC can affect health.</p>
+          <table class="range-table">
+            <thead><tr><th>Level</th><th>Range</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">Good</td><td>&lt; 220 ppb</td><td>Clean air</td></tr>
+              <tr><td class="quality-warn">Moderate</td><td>220 – 660 ppb</td><td>Some VOC sources present</td></tr>
+              <tr><td class="quality-bad">High</td><td>&gt; 660 ppb</td><td>Identify and remove sources</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Common sources: sprays, candles, new furniture, cooking</div>
+        </div>
+
+        <div class="info-card" style="--card-color:var(--c-validity)">
+          <div class="info-card-top">
+            <strong>ENS Validity</strong>
+            <code>ENS160</code>
+          </div>
+          <p>Internal status flag of the ENS160 chip indicating whether the sensor output is reliable. Air quality readings during states 1–3 should be treated with caution.</p>
+          <table class="range-table">
+            <thead><tr><th>Value</th><th>State</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td class="quality-ok">0</td><td>Normal</td><td>Readings are valid</td></tr>
+              <tr><td class="quality-warn">1</td><td>Warm-up</td><td>First ~30 s after power-on</td></tr>
+              <tr><td class="quality-warn">2</td><td>Start-up</td><td>Initial conditioning (~3 min)</td></tr>
+              <tr><td class="quality-bad">3</td><td>Invalid</td><td>Sensor error, check wiring</td></tr>
+            </tbody>
+          </table>
+          <div class="info-note">Always check validity before acting on air-quality readings</div>
+        </div>
+
+      </div>
+    </details>
+
+  </main>
+
+  <div id="chartTooltip">
+    <div class="tt-time" id="ttTime"></div>
+    <div id="ttRows"></div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
