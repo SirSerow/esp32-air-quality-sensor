@@ -205,6 +205,32 @@ Open `http://localhost:8000/` on that machine. Replace `192.168.1.50` with the E
 
 The server persists data in a Docker volume named `co2_sensor_data`. On first successful connection it calls the ESP32 `/api/v1/sync?since=0` endpoint until all available history has been imported, then continues incremental polling using the returned cursor. See `server/README.md` for API details and operational notes.
 
+### Migrating the analysis server to another machine
+
+Use the migration scripts to move the Docker volume that contains the SQLite
+database. The export script stops the server briefly so the SQLite database and
+WAL files are captured consistently, then restarts it.
+
+On the current machine:
+
+```bash
+./scripts/export-server-data.sh
+scp backups/co2-sensor-data-*.tgz pi@raspberrypi.local:/home/pi/co2-sensor/
+```
+
+On the new Raspberry Pi, from the repository root:
+
+```bash
+./scripts/import-server-data-raspberry-pi.sh co2-sensor-data-YYYYMMDDTHHMMSSZ.tgz
+curl http://localhost:8000/api/status
+```
+
+Set `SENSOR_BASE_URL` in `.env` on the Raspberry Pi to the ESP32 STA IP address
+or pass it when starting Compose. A 64-bit Raspberry Pi OS install is
+recommended for Docker. The server image uses the official multi-architecture
+Python image and avoids optional native Uvicorn extras, so it should build on a
+Raspberry Pi without project-specific Docker changes.
+
 ## Web Analysis Dashboard
 
 The companion analysis server (`server/`) runs as a Docker container and provides a full-featured dashboard accessible from any browser on the local network.

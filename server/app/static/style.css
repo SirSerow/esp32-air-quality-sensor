@@ -711,9 +711,17 @@ tr:last-child td { border-bottom: none; }
   .settings-panel { padding: 12px; }
   .overview, .summary { grid-template-columns: 1fr 1fr; }
   .controls { padding: 10px; gap: 8px; }
+  .charts { gap: 16px; }
+  .charts article { padding: 12px 10px 10px; }
   .hide-xs { display: none !important; }
-  canvas.tall  { aspect-ratio: 4 / 1; }
-  canvas.short { aspect-ratio: 5 / 1; }
+  canvas,
+  canvas.tall,
+  canvas.short,
+  .charts article[data-expanded="true"] canvas,
+  .charts article[data-default-span="2"][data-expanded="true"] canvas {
+    aspect-ratio: 16 / 10 !important;
+    min-height: 190px;
+  }
 }
 
 @media (max-width: 380px) {

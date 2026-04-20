@@ -271,7 +271,14 @@ function drawChart(canvasId, metricKey) {
   ctx.fillStyle = bgColor;
   ctx.fillRect(0, 0, w, h);
 
-  const pad = { left: 56, right: 18, top: 14, bottom: 46 };
+  const compactChart = w < 520;
+  const axisFontSize = compactChart ? 12 : 11;
+  const pad = {
+    left: compactChart ? 62 : 56,
+    right: compactChart ? 12 : 18,
+    top: 14,
+    bottom: compactChart ? 42 : 46,
+  };
   const plotW = w - pad.left - pad.right;
   const plotH = h - pad.top - pad.bottom;
 
@@ -298,8 +305,9 @@ function drawChart(canvasId, metricKey) {
   if (metric.yMin != null) dataMin = Math.min(dataMin, metric.yMin);
   if (metric.yMax != null) dataMax = Math.max(dataMax, metric.yMax);
 
-  // Nice Y axis ticks
-  const { ticks: yTicks, min: yMin, max: yMax } = niceRange(dataMin, dataMax);
+  // Nice Y axis ticks. Keep labels readable on narrow portrait layouts.
+  const yTickTarget = Math.max(3, Math.min(6, Math.floor(plotH / (axisFontSize * 3.2))));
+  const { ticks: yTicks, min: yMin, max: yMax } = niceRange(dataMin, dataMax, yTickTarget);
 
   const xScale = (x) => pad.left + ((x - minX) / spanX) * plotW;
   const yScale = (y) => pad.top + (1 - (y - yMin) / Math.max(1e-9, yMax - yMin)) * plotH;
@@ -318,7 +326,7 @@ function drawChart(canvasId, metricKey) {
   }
 
   // ── Y grid lines ───────────────────────────────────────────────────────
-  ctx.font = `11px system-ui`;
+  ctx.font = `${axisFontSize}px system-ui`;
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   for (const tick of yTicks) {
@@ -335,7 +343,7 @@ function drawChart(canvasId, metricKey) {
   }
 
   // ── X axis ticks ───────────────────────────────────────────────────────
-  const xTicks = niceTimeTicks(minX, maxX, Math.max(4, Math.min(8, Math.floor(plotW / 80))));
+  const xTicks = niceTimeTicks(minX, maxX, Math.max(3, Math.min(8, Math.floor(plotW / (compactChart ? 96 : 80)))));
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   for (const tick of xTicks) {

@@ -31,6 +31,29 @@ Use the ESP32 STA IP address from the serial boot log when possible. The
 resolve from inside a Linux container unless the host is specifically set up for
 container mDNS.
 
+## Migrate to another machine
+
+From the repository root on the current machine:
+
+```bash
+./scripts/export-server-data.sh
+scp backups/co2-sensor-data-*.tgz pi@raspberrypi.local:/home/pi/co2-sensor/
+```
+
+From the repository root on the Raspberry Pi:
+
+```bash
+./scripts/import-server-data-raspberry-pi.sh co2-sensor-data-YYYYMMDDTHHMMSSZ.tgz
+curl http://localhost:8000/api/status
+```
+
+The import script creates the Compose container and data volume if needed,
+restores the archive into `/data`, and starts the server.
+
+For Raspberry Pi deployments, use 64-bit Raspberry Pi OS when possible. The
+Dockerfile uses the official multi-architecture Python image, and the runtime
+dependencies avoid optional native Uvicorn extras for better ARM compatibility.
+
 ## Sync Behavior
 
 The collector uses the firmware API under `/api/v1`:
