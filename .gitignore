@@ -26,3 +26,18 @@ CLAUDE*
 *.csv
 *.log
 backups/
+
+# KiCad local state and generated PCB production artifacts
+sensor-pcb/**/*.kicad_prl
+sensor-pcb/**/~*.kicad_*.lck
+sensor-pcb/**/*-backups/
+sensor-pcb/**/production/
+
+node_modules/
+
+outputs/
+rev1/
+rev2/
+rev3/
+v2/
+v3/
